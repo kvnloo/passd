@@ -1,0 +1,69 @@
+{
+  "schema": "passd-capability-bench-v1",
+  "results": [
+    {
+      "name": "direct token auth",
+      "n": 1000,
+      "median_us": 11.441500000000001,
+      "p95_us": 13.153,
+      "p99_us": 33.171,
+      "mean_us": 12.519078
+    },
+    {
+      "name": "direct capability load+validate",
+      "n": 1000,
+      "median_us": 19.4255,
+      "p95_us": 26.323,
+      "p99_us": 79.854,
+      "mean_us": 21.884033
+    },
+    {
+      "name": "direct item decrypt+version",
+      "n": 1000,
+      "median_us": 58.7375,
+      "p95_us": 129.232,
+      "p99_us": 323.168,
+      "mean_us": 74.41253999999999
+    },
+    {
+      "name": "direct lease claim+version checks",
+      "n": 1000,
+      "median_us": 216.534,
+      "p95_us": 476.11,
+      "p99_us": 2376.812,
+      "mean_us": 296.82969299999996
+    },
+    {
+      "name": "persistent capability.list RPC",
+      "n": 1000,
+      "median_us": 160.5115,
+      "p95_us": 306.137,
+      "p99_us": 839.682,
+      "mean_us": 203.556834
+    },
+    {
+      "name": "persistent access.status RPC",
+      "n": 1000,
+      "median_us": 186.5575,
+      "p95_us": 321.732,
+      "p99_us": 542.994,
+      "mean_us": 221.758794
+    },
+    {
+      "name": "build urllib opener (avoided)",
+      "n": 200,
+      "median_us": 10117.954,
+      "p95_us": 19313.497,
+      "p99_us": 66609.558,
+      "mean_us": 12981.9529
+    },
+    {
+      "name": "full capability.invoke loopback",
+      "n": 100,
+      "median_us": 1559.5955,
+      "p95_us": 2443.511,
+      "p99_us": 4225.835,
+      "mean_us": 1676.1360200000001
+    }
+  ]
+}

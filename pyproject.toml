@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "passd-local"
+version = "0.3.1"
+description = "Local encrypted capability broker inspired by Proton Pass agent workflows"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=45"]
+license = {text = "GPL-3.0-or-later"}
+
+[project.scripts]
+passd = "passd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["passd*"]
