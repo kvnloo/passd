@@ -248,6 +248,26 @@ principal -> immutable request digest -> human decision -> bounded lease -> rece
 
 That contract should also back privileged local actions such as your `hermes-privilege-broker`. Do **not** merge root execution and credential custody into one process. See [`AUTHORITY_CONTRACT.md`](AUTHORITY_CONTRACT.md) and [`INTEGRATION_MAP.md`](INTEGRATION_MAP.md).
 
+## Sensitive documents and raw PII
+
+`passd` deliberately does **not** store PDFs, bank statements, tax documents, or authenticated browser sessions.
+
+Sensitive workflows use a separate private execution zone:
+
+```text
+frontier Hermes
+  -> typed request
+  -> private executor
+       + passd credentials
+       + external document system
+       + local-only model when needed
+       + deterministic domain engine
+  -> sanitized receipt
+  -> frontier Hermes
+```
+
+This keeps credential custody, document lifecycle, and raw-PII reasoning independently replaceable while preserving the same authority vocabulary. See [`PRIVATE_EXECUTION.md`](PRIVATE_EXECUTION.md) and [`INTEGRATION_MAP.md`](INTEGRATION_MAP.md).
+
 ## Latency optimization kernel
 
 ```bash
