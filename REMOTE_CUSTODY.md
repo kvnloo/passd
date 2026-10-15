@@ -12,7 +12,7 @@ For the stated threat model, move credential custody off the coding/agent host.
 A. Agent/compute host                         B. Credential-custody host
 ----------------------------------------      ---------------------------------
 Hermes / OMP / Codex / Cursor                 passd only
-Kerdoios / z0int runtime                      encrypted Proton mirror
+Kerdoios / z0int runtime                      scoped Proton AGENT session
 hermes-privilege-broker (root actions)        root key / master unlock
 PASSD_AGENT_TOKEN only                        outbound provider connections
 NO passd master password                      NO general coding agents
@@ -24,6 +24,14 @@ review request digest + reason + budgets
 approve/deny
 no routine secret reveal
 ```
+
+The custody host stores the Proton agent PAT in passd's encrypted internal store
+and owns `<data dir>/proton-agent/session` with mode 0700. Deliver and rotate the
+PAT through the human local admin path only; the agent gateway cannot manage or
+read it. Use item-level viewer grants and the persistent `passd proton-agent
+disable` kill switch. See [PROTON_AGENT.md](PROTON_AGENT.md). An encrypted imported
+mirror remains optional legacy storage; ZIP import is deprecated and never a
+fallback when a live-source read fails.
 
 ## What an agent-host root compromise can do
 

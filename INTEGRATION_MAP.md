@@ -15,6 +15,12 @@ Harness skills should ask for a capability ID, never a vault selector. A task th
 
 Use a persistent `PassdSession` for in-process integrations. Shelling out to the CLI is convenient but not the latency-critical path.
 
+Proton credentials can use a live, scoped AGENT session on the custody host.
+Administrators grant individual items as viewer and bind private source/ref fields
+to capabilities. Agents keep the same request/approve/invoke workflow and never
+receive the Proton PAT or field value. See [PROTON_AGENT.md](PROTON_AGENT.md).
+ZIP import is an optional, deprecated legacy bridge, never a live-source fallback.
+
 ## Sensitive-data / private execution zone
 
 The broader PII architecture does **not** make `passd` a document store.

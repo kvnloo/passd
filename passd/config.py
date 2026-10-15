@@ -24,6 +24,10 @@ class Config:
     data_dir: Path
     salt: bytes
     root_check: str
+    proton_agent_binary: str = "pass-cli"
+    proton_agent_name: str = "passd-groot"
+    proton_agent_timeout: float = 20.0
+    alert_command: list[str] | None = None
 
     @property
     def path(self) -> Path:
@@ -74,4 +78,14 @@ class Config:
         obj = json.loads(path.read_text())
         if obj.get("version") != 1:
             raise ValueError("unsupported passd config version")
-        return cls(data_dir=data_dir, salt=b64d(obj["salt"]), root_check=obj["root_check"])
+        proton = obj.get("proton_agent") or {}
+        command = obj.get("alert_command")
+        if command is not None and (not isinstance(command, list) or not command or not all(isinstance(s, str) and s for s in command)):
+            raise ValueError("alert_command must be a nonempty argv list")
+        return cls(
+            data_dir=data_dir, salt=b64d(obj["salt"]), root_check=obj["root_check"],
+            proton_agent_binary=proton.get("binary", "pass-cli"),
+            proton_agent_name=proton.get("name", "passd-groot"),
+            proton_agent_timeout=float(proton.get("timeout_seconds", 20.0)),
+            alert_command=command,
+        )

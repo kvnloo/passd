@@ -8,14 +8,18 @@
 - a human approves an exact, short-lived/use-limited lease;
 - `passd` uses the backing credential without returning it whenever possible.
 
-The full Proton vault can be imported, but importing a credential does **not** make it agent-accessible. A secret becomes requestable only when an administrator explicitly maps it to a capability.
+Use a scoped Proton Pass AGENT session for live credentials, or store credentials
+in passd's encrypted custody. A secret becomes requestable only when an
+administrator maps it to a capability. See [PROTON_AGENT.md](PROTON_AGENT.md) for
+item-level viewer grants, PAT delivery, rotation, and the kill switch. ZIP import
+remains an optional, deprecated legacy bridge.
 
 ## The v0.3 invariant
 
 ```text
 Proton / human vault
         |
-        | one-way snapshot import
+        | scoped live agent source / optional legacy import
         v
   encrypted passd custody
         |
@@ -88,13 +92,15 @@ The local daemon uses an owner-only Unix socket (`0600`). Data directory is `070
 
 For high-assurance use, do **not** colocate custody with coding agents. See [`REMOTE_CUSTODY.md`](REMOTE_CUSTODY.md).
 
-## Import credentials
+## Optional legacy import
 
 ```bash
 passd sync import-proton 'Proton Pass_export_....zip'
 ```
 
-The Proton bridge is one-way/upsert-only. It does not call Proton's paid CLI service or bypass Proton production entitlement checks.
+ZIP import is deprecated and one-way/upsert-only. New Proton integrations should
+use the [live agent source](PROTON_AGENT.md). Neither path bypasses Proton
+production entitlement checks.
 
 Manual local example:
 
@@ -203,7 +209,10 @@ machine identity
 + atomic use budget
 ```
 
-A capability-definition change or actual credential rotation makes the lease `stale`. Editing unrelated item metadata does not.
+A capability-definition change makes the lease `stale`. For stored credentials,
+actual credential rotation also makes it stale; unrelated metadata edits do not.
+Live Proton leases bind the source/ref and agent name and read the current field
+only at invocation time, after authority and destination checks.
 
 ## Invoke without revealing the credential
 

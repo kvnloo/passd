@@ -37,6 +37,24 @@ def agent_token(args) -> str | None:
     return getattr(args, "agent_token", None) or os.environ.get("PASSD_AGENT_TOKEN")
 
 
+def read_pat_stdin() -> str:
+    """Read only stdin, disabling terminal echo without opening /dev/tty."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline(65538).removesuffix("\n").removesuffix("\r")
+    import termios
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    hidden = list(previous)
+    hidden[3] &= ~termios.ECHO
+    print("Proton agent PAT: ", end="", file=sys.stderr, flush=True)
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, hidden)
+        return sys.stdin.readline(65538).removesuffix("\n").removesuffix("\r")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        print(file=sys.stderr)
+
+
 def reason(args) -> str | None:
     return getattr(args, "reason", None) or os.environ.get("PASSD_AGENT_REASON")
 
@@ -83,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--i-know-what-im-doing", action="store_true", help="permit binding to all interfaces")
     g.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS, help="maximum concurrent gateway connections (default: 32)")
     sub.add_parser("doctor", help="check configuration and daemon")
+    pa = sub.add_parser("proton-agent", help="admin: manage the isolated Proton agent source")
+    pas = pa.add_subparsers(dest="proton_agent_command", required=True)
+    for command in ("set-pat", "login", "status", "logout", "disable", "enable"):
+        pas.add_parser(command)
 
     v = sub.add_parser("vault", help="vault operations")
     vs = v.add_subparsers(dest="vault_command", required=True)
@@ -138,7 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
     put = cps.add_parser("put-http", help="admin: create/update an HTTP capability backed by one secret field")
     put.add_argument("capability_id")
     put.add_argument("--description", default="")
-    put.add_argument("--backing-uri", required=True, help="admin-only pass://VAULT/ITEM/FIELD backing selector")
+    put.add_argument("--source", choices=["stored", "proton-agent"], default="stored")
+    put.add_argument("--backing-uri", help="admin-only pass://VAULT/ITEM/FIELD backing selector")
+    put.add_argument("--share-id")
+    put.add_argument("--item-id")
+    put.add_argument("--vault-name")
+    put.add_argument("--item-title")
+    put.add_argument("--field")
     put.add_argument("--scheme", choices=["http", "https"], default="https")
     put.add_argument("--host", required=True)
     put.add_argument("--port", type=int)
@@ -264,6 +292,17 @@ def main(argv=None) -> int:
             output({"data_dir": str(cfg.data_dir), "socket": str(cfg.socket_path), "daemon": client.call("health")})
             return 0
 
+        if args.command == "proton-agent":
+            admin = password_from_env()
+            params = {}
+            try:
+                if args.proton_agent_command == "set-pat":
+                    params["pat"] = read_pat_stdin()
+                output(client.call("proton-agent." + args.proton_agent_command, params, admin_password=admin))
+            finally:
+                params.clear()
+            return 0
+
         if args.command == "vault":
             if args.vault_command == "list":
                 token = agent_token(args)
@@ -312,6 +351,7 @@ def main(argv=None) -> int:
                     "id": args.capability_id,
                     "description": args.description,
                     "kind": "http_secret",
+                    "source": args.source,
                     "backing_uri": args.backing_uri,
                     "scheme": args.scheme,
                     "host": args.host,
@@ -322,6 +362,9 @@ def main(argv=None) -> int:
                     "static_headers": kv_pairs(args.static_header),
                     "timeout_seconds": args.timeout,
                 }
+                ref = {key: getattr(args, key) for key in ("share_id", "item_id", "vault_name", "item_title", "field") if getattr(args, key) is not None}
+                if ref:
+                    params["ref"] = ref
                 if args.port is not None:
                     params["port"] = args.port
                 output(client.call("capability.put", params, admin_password=password_from_env()))
@@ -380,6 +423,7 @@ def main(argv=None) -> int:
             return 0
 
         if args.command == "sync":
+            print("passd: warning: Proton ZIP import is deprecated; use the live proton-agent source. Import remains available for optional legacy migration.", file=sys.stderr)
             result = import_export(client, args.path, admin_password=password_from_env())
             output(result)
             return 0
