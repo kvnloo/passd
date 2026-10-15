@@ -3,17 +3,21 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
-from .client import PassdClient, RpcError
+from .client import PassdClient, RpcError, parse_endpoint
 from .config import Config, default_data_dir
 from .db import connect
-from .errors import PassdError
+from .errors import INTERNAL_ERROR_MESSAGE, PassdError
+from .gateway import DEFAULT_MAX_CONNECTIONS, serve_gateway
 from .proton_import import import_export
 from .server import serve
 from .service import DEFAULT_ACCESS_TTL, PassdService
+
+logger = logging.getLogger(__name__)
 
 
 def password_from_env(*, confirm: bool = False, prompt: str = "Master password: ") -> str:
@@ -55,6 +59,8 @@ def output(value, *, raw: bool = False):
 
 
 def get_client(data_dir: Path) -> PassdClient:
+    if os.environ.get("PASSD_REMOTE"):
+        return PassdClient()
     cfg = Config.load(data_dir)
     return PassdClient(cfg.socket_path)
 
@@ -71,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="initialize encrypted storage")
     x = sub.add_parser("serve", help="run the local Unix-socket daemon")
     x.add_argument("--allow-private-broker-targets", action="store_true", help="allow broker requests to private/loopback IPs (development only)")
+    g = sub.add_parser("gateway", help="forward agent-only TCP requests to the local daemon")
+    g.add_argument("--listen", required=True, type=parse_endpoint, metavar="HOST:PORT")
+    g.add_argument("--allow-cidr", action="append", help="allowed source CIDR; repeatable, replaces tailnet/loopback defaults")
+    g.add_argument("--i-know-what-im-doing", action="store_true", help="permit binding to all interfaces")
+    g.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS, help="maximum concurrent gateway connections (default: 32)")
     sub.add_parser("doctor", help="check configuration and daemon")
 
     v = sub.add_parser("vault", help="vault operations")
@@ -236,7 +247,18 @@ def main(argv=None) -> int:
             serve(cfg.socket_path, service)
             return 0
 
+        if args.command == "gateway":
+            socket_path = Path(os.environ["PASSD_SOCKET"]).expanduser() if os.environ.get("PASSD_SOCKET") else Config.load(data_dir).socket_path
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+            serve_gateway(socket_path, args.listen, allow_cidrs=args.allow_cidr, i_know_what_im_doing=args.i_know_what_im_doing, max_connections=args.max_connections)
+            return 0
+
         client = get_client(data_dir)
+        if client.remote and not (
+            args.command == "capability" and args.capability_command in {"list", "request", "invoke"}
+            or args.command == "access" and args.access_command in {"request", "status"}
+        ):
+            raise RpcError("forbidden_remote_op", "remote CLI commands require the agent-only gateway API")
         if args.command == "doctor":
             cfg = Config.load(data_dir)
             output({"data_dir": str(cfg.data_dir), "socket": str(cfg.socket_path), "daemon": client.call("health")})
@@ -282,7 +304,7 @@ def main(argv=None) -> int:
         if args.command == "capability":
             if args.capability_command == "list":
                 token = agent_token(args)
-                output(client.call("capability.list", agent_token=token) if token else client.call("capability.list", admin_password=password_from_env()))
+                output(client.call("capability.list", agent_token=token) if token or client.remote else client.call("capability.list", admin_password=password_from_env()))
             elif args.capability_command == "get":
                 output(client.call("capability.get", {"id": args.capability_id}, admin_password=password_from_env()))
             elif args.capability_command == "put-http":
@@ -362,9 +384,13 @@ def main(argv=None) -> int:
             output(result)
             return 0
         return 2
-    except (PassdError, RpcError, ValueError, OSError, json.JSONDecodeError) as exc:
-        code = getattr(exc, "code", "error")
-        print(f"passd: {code}: {exc}", file=sys.stderr)
+    except Exception as exc:
+        if isinstance(exc, PassdError) and exc.code != "internal_error":
+            code, message = exc.code, str(exc)
+        else:
+            logger.error("%s", type(exc).__name__)
+            code, message = "internal_error", INTERNAL_ERROR_MESSAGE
+        print(f"passd: {code}: {message}", file=sys.stderr)
         return 2
 
 

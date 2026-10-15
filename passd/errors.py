@@ -1,3 +1,6 @@
+INTERNAL_ERROR_MESSAGE = "internal error"
+
+
 class PassdError(Exception):
     code = "passd_error"
 
