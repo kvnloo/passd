@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+def canary():
+    return "pst_" + "enrollment-canary" + "::" + "private-key"
+
+root = Path(__file__).parent
+mode = (root / "mode").read_text()
+args = sys.argv[1:]
+session = Path(os.environ["PROTON_PASS_SESSION_DIR"])
+pat = os.environ.get("PROTON_PASS_PERSONAL_ACCESS_TOKEN")
+assert canary() not in repr(args)
+with (root / "calls").open("a") as calls:
+    calls.write(json.dumps([args, str(session), bool(pat)]) + "\n")
+
+marker = session / "logged-in"
+if args == ["login"]:
+    if pat:
+        assert pat == canary()
+        assert mode != "login-fail"
+        marker.touch()
+    else:
+        assert stat.S_IMODE(session.stat().st_mode) == 0o700
+        assert os.environ["PROTON_PASS_KEY_PROVIDER"] == "fs"
+        print("Please open the following URL in your browser to complete authentication:")
+        print("https://account.proton.me/desktop/login?app=pass#payload=test", flush=True)
+        print("Owner account details")
+        marker.touch()
+        if mode == "refused":
+            sys.exit("Your account is not yet allowed to use our CLI")
+elif args == ["logout", "--force"]:
+    # Leave a marker so tests exercise removal even when logout leaves files.
+    pass
+elif args == ["vault", "list", "--output", "json"]:
+    assert marker.exists()
+    vaults = [{"name": "agents", "share_id": "agents-share"}]
+    if mode == "missing" and not (session / "vault-created").exists():
+        vaults = []
+    if mode == "duplicate":
+        vaults *= 2
+    print(json.dumps({"vaults": vaults}))
+elif args == ["vault", "create", "--name", "agents"]:
+    (session / "vault-created").touch()
+elif args == ["agent", "list", "--output", "json"]:
+    created = (session / "agent-created").exists()
+    print(json.dumps([{"name": "passd-test", "pat_id": "agent-id"}] if created or mode == "existing" else []))
+elif args == ["agent", "create", "passd-test", "--expiration", "1w", "--vault", "agents"]:
+    (session / "agent-created").touch()
+    print(canary(), file=sys.stderr)
+    if mode == "bad-token":
+        print(canary())
+    else:
+        print(json.dumps({"token": "PROTON_PASS_PERSONAL_ACCESS_TOKEN=" + canary()}))
+elif args == ["pat", "access", "list-access", "--pat-id", "agent-id", "--output", "json"]:
+    grants = [{"type": "vault", "vault_name": "agents", "role": "Viewer", "share_id": "agents-share"}]
+    if mode == "extra":
+        grants.append({"type": "vault", "vault_name": "Personal"})
+    if mode == "wrong-share":
+        grants[0]["share_id"] = "other-share"
+    print(canary() if mode == "malformed" else json.dumps(grants))
+elif args == ["agent", "delete", "passd-test"]:
+    assert marker.exists()
+elif args == ["info"]:
+    assert marker.exists()
+else:
+    sys.exit("unexpected arguments")
