@@ -11,6 +11,7 @@ from pathlib import Path
 from .client import PassdClient, RpcError, parse_endpoint
 from .config import Config, default_data_dir
 from .db import connect
+from .enroll_proton import StockProtonRunner, enroll_proton
 from .errors import INTERNAL_ERROR_MESSAGE, PassdError
 from .gateway import DEFAULT_MAX_CONNECTIONS, serve_gateway
 from .proton_import import import_export
@@ -101,6 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--i-know-what-im-doing", action="store_true", help="permit binding to all interfaces")
     g.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS, help="maximum concurrent gateway connections (default: 32)")
     sub.add_parser("doctor", help="check configuration and daemon")
+    enroll = sub.add_parser("enroll", help="admin: enroll an external credential source")
+    enroll.add_subparsers(dest="enroll_source", required=True).add_parser("proton")
     pa = sub.add_parser("proton-agent", help="admin: manage the isolated Proton agent source")
     pas = pa.add_subparsers(dest="proton_agent_command", required=True)
     for command in ("set-pat", "login", "status", "logout", "disable", "enable"):
@@ -290,6 +293,17 @@ def main(argv=None) -> int:
         if args.command == "doctor":
             cfg = Config.load(data_dir)
             output({"data_dir": str(cfg.data_dir), "socket": str(cfg.socket_path), "daemon": client.call("health")})
+            return 0
+
+        if args.command == "enroll":
+            try:
+                enroll_proton(
+                    client, password_from_env(), runner=StockProtonRunner(),
+                    show_url=lambda url: print(url, flush=True),
+                )
+            except KeyboardInterrupt:
+                print("passd: Proton enrollment interrupted.", file=sys.stderr)
+                return 130
             return 0
 
         if args.command == "proton-agent":
