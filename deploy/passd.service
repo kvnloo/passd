@@ -1,0 +1,27 @@
+[Unit]
+Description=passd encrypted custody broker
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+User=passd
+Group=passd-admin
+Environment=PASSD_DATA_DIR=/var/lib/passd PASSD_SOCKET=/run/passd/passd.sock
+StandardInput=file:/run/passd-unlock/input
+StandardOutput=journal
+StandardError=journal
+ExecStart=/opt/passd/bin/passd serve --master-password-stdin --group-socket
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/passd /run/passd
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitCORE=0
+TimeoutStopSec=10s
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
