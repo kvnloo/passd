@@ -24,6 +24,7 @@ SECRET = "gateway-dummy-secret-never-on-agent-host"
 
 class EchoHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path.startswith("/echo/malformed-status"):
             self.wfile.write(f"{SECRET}\r\n\r\n".encode())
             return

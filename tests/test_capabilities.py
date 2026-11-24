@@ -21,6 +21,7 @@ class CapabilityHandler(BaseHTTPRequestHandler):
     hits = 0
 
     def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
         type(self).hits += 1
         auth = self.headers.get("Authorization")
         content_type = self.headers.get("Content-Type")

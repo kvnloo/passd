@@ -49,6 +49,9 @@ class PassdHandler(socketserver.StreamRequestHandler):
 class PassdUnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Darwin can refuse new Unix connections when the default queue fills
+    # during a burst, before the accept loop can start their handler threads.
+    request_queue_size = 128
 
     def __init__(self, socket_path: Path, service):
         self.socket_path = socket_path
