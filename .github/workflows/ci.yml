@@ -1,0 +1,31 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: python -m pip install cryptography pytest
+      - name: Run full suite
+        run: python -m pytest --basetemp=.pytest-tmp
+      - name: Verify and replay RLP vectors
+        if: ${{ !cancelled() }}
+        run: |
+          (cd spec/vectors && shasum -a 256 -c SHA256SUMS)
+          python -m pytest -v tests/test_rlp_vectors.py

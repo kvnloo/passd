@@ -170,6 +170,7 @@ def network_custody(custody, monkeypatch):
     with ExitStack() as stack:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 auth = self.headers.get("Authorization")
                 c.hits.append((self.path, auth))
                 self.send_response(200)
@@ -198,6 +199,8 @@ def test_minimal_environment_reason_and_live_injection(custody, request, transpo
     monkeypatch.setenv("PROTON_PASS_OTHER", "bogus-parent-setting")
     monkeypatch.setenv("XDG_CONFIG_HOME", "/bogus-human-home")
     monkeypatch.setenv("PASSD_MASTER_PASSWORD", MASTER)
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.setenv(name, "bogus-parent-proxy")
     c.source.login()
     lease = c.approve()
     assert len(c.calls("item")) == 0  # Approval never fetches live credentials.
@@ -211,8 +214,12 @@ def test_minimal_environment_reason_and_live_injection(custody, request, transpo
         assert env["PROTON_PASS_SESSION_DIR"] == str(c.cfg.data_dir / "proton-agent/session")
         assert env["HOME"] == str(c.cfg.data_dir / "proton-agent")
         # Python may add LC_CTYPE itself when started without locale settings.
-        assert set(env) <= {"PATH", "HOME", "LANG", "LC_CTYPE", "PROTON_PASS_SESSION_DIR",
-                            "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PROTON_PASS_AGENT_REASON"}
+        allowed = {"PATH", "HOME", "LANG", "LC_CTYPE", "PROTON_PASS_SESSION_DIR",
+                   "PROTON_PASS_PERSONAL_ACCESS_TOKEN", "PROTON_PASS_AGENT_REASON"}
+        if sys.platform == "darwin":
+            # macOS injects this platform variable when launching the child.
+            allowed.add("__CF_USER_TEXT_ENCODING")
+        assert set(env) <= allowed
         assert PAT not in json.dumps(argv)
         assert "--show-secrets" not in argv
         if argv[0] == "login":
