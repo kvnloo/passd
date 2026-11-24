@@ -5,6 +5,7 @@ import getpass
 import json
 import logging
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from .client import PassdClient, RpcError, parse_endpoint
 from .config import Config, default_data_dir
 from .db import connect
 from .enroll_proton import StockProtonRunner, enroll_proton
-from .errors import INTERNAL_ERROR_MESSAGE, PassdError
+from .errors import INTERNAL_ERROR_MESSAGE, PassdError, ValidationError
 from .gateway import DEFAULT_MAX_CONNECTIONS, serve_gateway
 from .proton_import import import_export
 from .server import serve
@@ -21,9 +22,45 @@ from .service import DEFAULT_ACCESS_TTL, PassdService
 logger = logging.getLogger(__name__)
 
 
-def password_from_env(*, confirm: bool = False, prompt: str = "Master password: ") -> str:
+def read_secret_line() -> str:
+    """Read one logical line, with terminal echo disabled when applicable."""
+    if sys.stdin.isatty():
+        import termios
+
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        hidden = list(previous)
+        hidden[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, hidden)
+        try:
+            line = sys.stdin.readline()
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, previous)
+    else:
+        line = sys.stdin.readline()
+    if not line or not line.removesuffix("\n"):
+        raise ValidationError("expected a nonempty secret line on stdin")
+    return line.removesuffix("\n")
+
+
+def read_private_password_file(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8") as stream:
+        mode = os.fstat(stream.fileno()).st_mode
+        if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+            raise ValidationError("password file must be a regular file with mode 0600")
+        return stream.read().removesuffix("\n")
+
+
+def master_password(args, *, confirm: bool = False, prompt: str = "Master password: ") -> str:
+    if args.master_password_stdin:
+        return read_secret_line()
+    return password_from_env(confirm=confirm, prompt=prompt)
+
+
+def password_from_env(*, confirm: bool, prompt: str) -> str:
     if os.environ.get("PASSD_MASTER_PASSWORD_FILE"):
-        return Path(os.environ["PASSD_MASTER_PASSWORD_FILE"]).expanduser().read_text().strip()
+        return read_private_password_file(Path(os.environ["PASSD_MASTER_PASSWORD_FILE"]).expanduser())
     if os.environ.get("PASSD_MASTER_PASSWORD"):
         return os.environ["PASSD_MASTER_PASSWORD"]
     first = getpass.getpass(prompt)
@@ -34,8 +71,8 @@ def password_from_env(*, confirm: bool = False, prompt: str = "Master password: 
     return first
 
 
-def agent_token(args) -> str | None:
-    return getattr(args, "agent_token", None) or os.environ.get("PASSD_AGENT_TOKEN")
+def agent_token() -> str | None:
+    return os.environ.get("PASSD_AGENT_TOKEN")
 
 
 def read_pat_stdin() -> str:
@@ -80,22 +117,37 @@ def output(value, *, raw: bool = False):
 def get_client(data_dir: Path) -> PassdClient:
     if os.environ.get("PASSD_REMOTE"):
         return PassdClient()
-    cfg = Config.load(data_dir)
-    return PassdClient(cfg.socket_path)
+    if socket_path := os.environ.get("PASSD_SOCKET"):
+        return PassdClient(Path(socket_path).expanduser())
+    return PassdClient(Config.load(data_dir).socket_path)
 
 
 def add_common(p):
     p.add_argument("--data-dir", type=Path, default=default_data_dir(), help="passd data directory")
 
 
+class PassdArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, allow_abbrev=False, **kwargs)
+        self.add_argument(
+            "--master-password-stdin", action="store_true", default=argparse.SUPPRESS,
+            help="read the master password from the first line of stdin for admin operations",
+        )
+
+    def error(self, message):
+        # Argparse diagnostics can include the full text of rejected arguments.
+        super().error("invalid command arguments (see --help)")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="passd", description="Local encrypted secret capability broker")
+    p = PassdArgumentParser(prog="passd", description="Local encrypted secret capability broker")
     add_common(p)
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="initialize encrypted storage")
     x = sub.add_parser("serve", help="run the local Unix-socket daemon")
     x.add_argument("--allow-private-broker-targets", action="store_true", help="allow broker requests to private/loopback IPs (development only)")
+    x.add_argument("--group-socket", action="store_true", help="allow the daemon group to connect to the UNIX socket")
     g = sub.add_parser("gateway", help="forward agent-only TCP requests to the local daemon")
     g.add_argument("--listen", required=True, type=parse_endpoint, metavar="HOST:PORT")
     g.add_argument("--allow-cidr", action="append", help="allowed source CIDR; repeatable, replaces tailnet/loopback defaults")
@@ -112,7 +164,6 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("vault", help="vault operations")
     vs = v.add_subparsers(dest="vault_command", required=True)
     vl = vs.add_parser("list")
-    vl.add_argument("--agent-token")
     c = vs.add_parser("create")
     c.add_argument("name")
     c.add_argument("--description", default="")
@@ -121,20 +172,19 @@ def build_parser() -> argparse.ArgumentParser:
     ins = i.add_subparsers(dest="item_command", required=True)
     l = ins.add_parser("list")
     l.add_argument("vault")
-    l.add_argument("--agent-token")
     c = ins.add_parser("put-login")
     c.add_argument("--vault", required=True)
     c.add_argument("--title", required=True)
     c.add_argument("--username")
     c.add_argument("--email")
-    c.add_argument("--password")
-    c.add_argument("--password-file", type=Path)
+    secret = c.add_mutually_exclusive_group()
+    secret.add_argument("--password-stdin", action="store_true", help="read one secret line after any master password line")
+    secret.add_argument("--password-file", type=Path)
     c.add_argument("--url", action="append", default=[])
-    c.add_argument("--field", action="append", default=[], metavar="NAME=VALUE")
+    c.add_argument("--field-stdin", action="append", default=[], metavar="NAME", help="read each custom field value from stdin after the password")
     c.add_argument("--note", default="")
     vw = ins.add_parser("view")
     vw.add_argument("uri")
-    vw.add_argument("--agent-token")
     vw.add_argument("--reason")
     vw.add_argument("--raw", action="store_true")
 
@@ -157,7 +207,6 @@ def build_parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("capability", help="typed agent capabilities; backing secrets remain admin-only")
     cps = cp.add_subparsers(dest="capability_command", required=True)
     cl = cps.add_parser("list", help="list requestable capability contracts without secret selectors")
-    cl.add_argument("--agent-token")
     cg = cps.add_parser("get", help="admin: inspect one capability including encrypted backing selector after daemon decrypt")
     cg.add_argument("capability_id")
     put = cps.add_parser("put-http", help="admin: create/update an HTTP capability backed by one secret field")
@@ -185,7 +234,6 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--path", required=True)
     cr.add_argument("--expiration", default="5m")
     cr.add_argument("--uses", type=int, default=1)
-    cr.add_argument("--agent-token")
     cr.add_argument("--reason")
     ci = cps.add_parser("invoke", help="agent: invoke an already approved exact capability")
     ci.add_argument("capability_id")
@@ -193,7 +241,6 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--path", required=True)
     ci.add_argument("--body")
     ci.add_argument("--body-file", type=Path)
-    ci.add_argument("--agent-token")
     ci.add_argument("--reason")
 
     ac = sub.add_parser("access", help="HITL access requests and short-lived leases")
@@ -204,11 +251,9 @@ def build_parser() -> argparse.ArgumentParser:
     rq.add_argument("--host", help="exact destination hostname required for secret.use")
     rq.add_argument("--expiration", default="5m")
     rq.add_argument("--uses", type=int, default=1)
-    rq.add_argument("--agent-token")
     rq.add_argument("--reason")
     st = acs.add_parser("status", help="agent checks its own requests")
     st.add_argument("request", nargs="?")
-    st.add_argument("--agent-token")
     pe = acs.add_parser("pending", help="HITL: list pending requests")
     pe.add_argument("--limit", type=int, default=100)
     ap = acs.add_parser("approve", help="HITL: approve a pending request")
@@ -224,7 +269,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("resolve", help="resolve a pass:// secret reference; agents require an approved secret.reveal lease")
     r.add_argument("uri")
-    r.add_argument("--agent-token")
     r.add_argument("--reason")
     r.add_argument("--raw", action="store_true")
 
@@ -236,7 +280,6 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--prefix", default="Bearer ")
     b.add_argument("--body")
     b.add_argument("--header-extra", action="append", default=[], metavar="NAME=VALUE")
-    b.add_argument("--agent-token")
     b.add_argument("--reason")
     b.add_argument("--timeout", type=float, default=20)
 
@@ -261,10 +304,11 @@ def kv_pairs(values: list[str]) -> dict[str, str]:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    args.master_password_stdin = getattr(args, "master_password_stdin", False)
     data_dir = args.data_dir.expanduser()
     try:
         if args.command == "init":
-            password = password_from_env(confirm=not (os.environ.get("PASSD_MASTER_PASSWORD") or os.environ.get("PASSD_MASTER_PASSWORD_FILE")), prompt="New master password: ")
+            password = master_password(args, confirm=not (os.environ.get("PASSD_MASTER_PASSWORD") or os.environ.get("PASSD_MASTER_PASSWORD_FILE")), prompt="New master password: ")
             cfg = Config.initialize(data_dir, password)
             conn = connect(cfg.db_path); conn.close()
             print(f"Initialized passd at {cfg.data_dir}")
@@ -272,10 +316,13 @@ def main(argv=None) -> int:
 
         if args.command == "serve":
             cfg = Config.load(data_dir)
-            key = cfg.derive_and_verify(password_from_env())
+            key = cfg.derive_and_verify(master_password(args))
+            if args.master_password_stdin:
+                with open(os.devnull, "rb") as disconnected:
+                    os.dup2(disconnected.fileno(), sys.stdin.fileno())
             service = PassdService(cfg, key, allow_private_broker_targets=args.allow_private_broker_targets or os.environ.get("PASSD_ALLOW_PRIVATE_BROKER_TARGETS") == "1")
             print(f"passd listening on {cfg.socket_path}", file=sys.stderr)
-            serve(cfg.socket_path, service)
+            serve(cfg.socket_path, service, socket_mode=0o660 if args.group_socket else 0o600)
             return 0
 
         if args.command == "gateway":
@@ -298,7 +345,7 @@ def main(argv=None) -> int:
         if args.command == "enroll":
             try:
                 enroll_proton(
-                    client, password_from_env(), runner=StockProtonRunner(),
+                    client, master_password(args), runner=StockProtonRunner(),
                     show_url=lambda url: print(url, flush=True),
                 )
             except KeyboardInterrupt:
@@ -307,7 +354,7 @@ def main(argv=None) -> int:
             return 0
 
         if args.command == "proton-agent":
-            admin = password_from_env()
+            admin = master_password(args)
             params = {}
             try:
                 if args.proton_agent_command == "set-pat":
@@ -319,32 +366,45 @@ def main(argv=None) -> int:
 
         if args.command == "vault":
             if args.vault_command == "list":
-                token = agent_token(args)
-                output(client.call("vault.list", agent_token=token) if token else client.call("vault.list", admin_password=password_from_env()))
+                token = agent_token()
+                output(client.call("vault.list", agent_token=token) if token else client.call("vault.list", admin_password=master_password(args)))
             else:
-                output(client.call("vault.create", {"name": args.name, "description": args.description}, admin_password=password_from_env()))
+                output(client.call("vault.create", {"name": args.name, "description": args.description}, admin_password=master_password(args)))
             return 0
 
         if args.command == "item":
             if args.item_command == "list":
-                token = agent_token(args)
-                output(client.call("item.list", {"vault": args.vault}, agent_token=token) if token else client.call("item.list", {"vault": args.vault}, admin_password=password_from_env()))
+                token = agent_token()
+                output(client.call("item.list", {"vault": args.vault}, agent_token=token) if token else client.call("item.list", {"vault": args.vault}, admin_password=master_password(args)))
             elif args.item_command == "put-login":
-                fields = kv_pairs(args.field)
+                admin = master_password(args)
+                fields = {}
                 if args.username is not None: fields["username"] = args.username
                 if args.email is not None: fields["email"] = args.email
-                password = args.password_file.read_text().strip() if args.password_file else args.password
-                if password is None: password = getpass.getpass("Secret password/API key: ")
+                if args.password_stdin:
+                    password = read_secret_line()
+                elif args.password_file:
+                    password = read_private_password_file(args.password_file)
+                else:
+                    password = getpass.getpass("Secret password/API key: ")
+                for name in args.field_stdin:
+                    if name == "password" or name in fields:
+                        raise ValidationError("duplicate login field")
+                    fields[name] = read_secret_line()
                 fields["password"] = password
-                output(client.call("item.put", {"vault": args.vault, "title": args.title, "type": "login", "fields": fields, "urls": args.url, "note": args.note}, admin_password=password_from_env()))
+                result = client.call("item.put", {
+                    "vault": args.vault, "title": args.title, "type": "login",
+                    "fields": fields, "urls": args.url, "note": args.note,
+                }, admin_password=admin)
+                output({key: result[key] for key in ("id", "vault_id", "title", "type")})
             else:
-                token = agent_token(args)
-                kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": password_from_env()}
+                token = agent_token()
+                kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": master_password(args)}
                 output(client.call("secret.resolve", {"uri": args.uri}, **kwargs), raw=args.raw)
             return 0
 
         if args.command == "agent":
-            admin = password_from_env()
+            admin = master_password(args)
             if args.agent_command == "create":
                 scopes = args.scope or ["capability.request", "capability.invoke"]
                 output(client.call("agent.create", {"name": args.name, "scopes": scopes, "allowed_hosts": args.allow_host, "ttl_seconds": parse_ttl(args.expiration)}, admin_password=admin))
@@ -356,10 +416,10 @@ def main(argv=None) -> int:
 
         if args.command == "capability":
             if args.capability_command == "list":
-                token = agent_token(args)
-                output(client.call("capability.list", agent_token=token) if token or client.remote else client.call("capability.list", admin_password=password_from_env()))
+                token = agent_token()
+                output(client.call("capability.list", agent_token=token) if token or client.remote else client.call("capability.list", admin_password=master_password(args)))
             elif args.capability_command == "get":
-                output(client.call("capability.get", {"id": args.capability_id}, admin_password=password_from_env()))
+                output(client.call("capability.get", {"id": args.capability_id}, admin_password=master_password(args)))
             elif args.capability_command == "put-http":
                 params = {
                     "id": args.capability_id,
@@ -381,7 +441,7 @@ def main(argv=None) -> int:
                     params["ref"] = ref
                 if args.port is not None:
                     params["port"] = args.port
-                output(client.call("capability.put", params, admin_password=password_from_env()))
+                output(client.call("capability.put", params, admin_password=master_password(args)))
             elif args.capability_command == "request":
                 output(client.call(
                     "capability.request",
@@ -392,7 +452,7 @@ def main(argv=None) -> int:
                         "ttl_seconds": parse_ttl(args.expiration),
                         "max_uses": args.uses,
                     },
-                    agent_token=agent_token(args),
+                    agent_token=agent_token(),
                     reason=reason(args),
                 ))
             else:
@@ -400,45 +460,45 @@ def main(argv=None) -> int:
                 output(client.call(
                     "capability.invoke",
                     {"capability_id": args.capability_id, "method": args.method, "path": args.path, "body": body},
-                    agent_token=agent_token(args),
+                    agent_token=agent_token(),
                     reason=reason(args),
                 ))
             return 0
 
         if args.command == "access":
             if args.access_command == "request":
-                token = agent_token(args)
+                token = agent_token()
                 output(client.call("access.request", {"uri": args.uri, "capability": args.capability, "target_host": args.host, "ttl_seconds": parse_ttl(args.expiration), "max_uses": args.uses}, agent_token=token, reason=reason(args)))
             elif args.access_command == "status":
-                output(client.call("access.status", {"request": args.request} if args.request else {}, agent_token=agent_token(args)))
+                output(client.call("access.status", {"request": args.request} if args.request else {}, agent_token=agent_token()))
             elif args.access_command == "pending":
-                output(client.call("access.pending", {"limit": args.limit}, admin_password=password_from_env()))
+                output(client.call("access.pending", {"limit": args.limit}, admin_password=master_password(args)))
             elif args.access_command == "approve":
                 params = {"request": args.request, "note": args.note}
                 if args.expiration: params["ttl_seconds"] = parse_ttl(args.expiration)
                 if args.uses is not None: params["max_uses"] = args.uses
-                output(client.call("access.approve", params, admin_password=password_from_env()))
+                output(client.call("access.approve", params, admin_password=master_password(args)))
             elif args.access_command == "deny":
-                output(client.call("access.deny", {"request": args.request, "note": args.note}, admin_password=password_from_env()))
+                output(client.call("access.deny", {"request": args.request, "note": args.note}, admin_password=master_password(args)))
             else:
-                output(client.call("access.revoke", {"request": args.request}, admin_password=password_from_env()))
+                output(client.call("access.revoke", {"request": args.request}, admin_password=master_password(args)))
             return 0
 
         if args.command == "resolve":
-            token = agent_token(args)
-            kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": password_from_env()}
+            token = agent_token()
+            kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": master_password(args)}
             output(client.call("secret.resolve", {"uri": args.uri}, **kwargs), raw=args.raw)
             return 0
 
         if args.command == "broker-http":
-            token = agent_token(args)
-            kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": password_from_env()}
+            token = agent_token()
+            kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": master_password(args)}
             output(client.call("broker.http", {"uri": args.uri, "url": args.url, "method": args.method, "header": args.header, "prefix": args.prefix, "body": args.body, "headers": kv_pairs(args.header_extra), "timeout": args.timeout}, **kwargs))
             return 0
 
         if args.command == "sync":
             print("passd: warning: Proton ZIP import is deprecated; use the live proton-agent source. Import remains available for optional legacy migration.", file=sys.stderr)
-            result = import_export(client, args.path, admin_password=password_from_env())
+            result = import_export(client, args.path, admin_password=master_password(args))
             output(result)
             return 0
         return 2

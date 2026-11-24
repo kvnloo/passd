@@ -1,0 +1,44 @@
+[Unit]
+Description=passd tailnet agent gateway
+After=passd.service network-online.target tailscaled.service
+BindsTo=passd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+SupplementaryGroups=passd-admin
+Environment=PASSD_SOCKET=/run/passd/passd.sock
+EnvironmentFile=/etc/passd-gateway.conf
+ExecStart=/opt/passd/bin/passd gateway --listen ${PASSD_GATEWAY_LISTEN} --allow-cidr 100.64.0.0/10 --allow-cidr fd7a:115c:a1e0::/48
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+LimitCORE=0
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
