@@ -218,3 +218,18 @@ result as an unordered multiset. An `expect` object projects result fields
 or identifies an RPC failure with `error`. Successful invokes also require
 one matching injected request at the sink. Verify `SHA256SUMS` against the
 raw JSON bytes.
+
+From the repository root, check the published checksums and replay each case:
+
+```sh
+(cd spec/vectors && shasum -a 256 -c SHA256SUMS)
+python -m pytest -v tests/test_rlp_vectors.py
+```
+
+When intentionally changing the vectors, regenerate the manifest from the
+exact JSON files that companion implementations will consume, then rerun both
+checks:
+
+```sh
+(cd spec/vectors && LC_ALL=C shasum -a 256 *.json > SHA256SUMS)
+```
