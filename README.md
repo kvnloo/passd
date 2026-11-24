@@ -83,10 +83,11 @@ Python 3.11+ and `cryptography` are required.
 ## Initialize / serve
 
 ```bash
-export PASSD_MASTER_PASSWORD='use-a-real-secret-source-in-production'
-passd init
-passd serve
+printf '%s\n' "$PASSD_MASTER" | passd init --master-password-stdin
+printf '%s\n' "$PASSD_MASTER" | passd serve --master-password-stdin
 ```
+
+Feed the master password from your secret prompt. Each daemon restart requires a fresh unlock. See [broker deployment](deploy/README.md) for the systemd and tailnet setup.
 
 The local daemon uses an owner-only Unix socket (`0600`). Data directory is `0700`; config/database are `0600`.
 
@@ -113,14 +114,14 @@ production entitlement checks.
 Manual local example:
 
 ```bash
-passd vault create Personal
-passd item put-login \
-  --vault Personal \
-  --title OpenRouter \
-  --password-file /secure/path/openrouter-key
+printf '%s\n' "$PASSD_MASTER" | passd vault create Personal --master-password-stdin
+printf '%s\n' "$PASSD_MASTER" "$ITEM_SECRET" |
+  passd item put-login --vault Personal --title OpenRouter --master-password-stdin --password-stdin
 ```
 
-Vault/item commands are admin/migration surfaces. New agent integrations should use capabilities.
+Send the master password on line 1 and the login password on line 2. Repeated
+`--field-stdin NAME` flags consume further lines in argument order. Vault/item
+commands are admin/migration surfaces. New agent integrations should use capabilities.
 
 ## Define one requestable capability
 

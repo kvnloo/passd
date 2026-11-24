@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -11,12 +12,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from passd.cli import build_parser
+
 ROOT = Path(__file__).resolve().parents[1]
 MASTER = "process-e2e-master"
 
 
 class CliProcessE2E(unittest.TestCase):
-    def run_cli(self, state: Path, *args: str, env: dict | None = None, ok: bool = True):
+    def run_cli(self, state: Path, *args: str, env: dict | None = None, ok: bool = True, stdin: str | None = None):
         e = {**os.environ, "PYTHONPATH": str(ROOT), "PASSD_MASTER_PASSWORD": MASTER}
         if env:
             e.update(env)
@@ -25,12 +28,50 @@ class CliProcessE2E(unittest.TestCase):
             cwd=ROOT,
             env=e,
             text=True,
+            input=stdin,
             capture_output=True,
             timeout=10,
         )
         if ok and cp.returncode != 0:
             self.fail(f"command failed: {args}\nstdout={cp.stdout}\nstderr={cp.stderr}")
         return cp
+
+    def test_password_and_token_values_have_no_cli_flags(self):
+        def options(parser):
+            for action in parser._actions:
+                yield from action.option_strings
+                if isinstance(action, argparse._SubParsersAction):
+                    for child in action.choices.values():
+                        yield from options(child)
+
+        parser = build_parser()
+        flags = set(options(parser))
+        self.assertTrue({"--master-password-stdin", "--password-stdin"} <= flags)
+        self.assertTrue({"--password", "--agent-token"}.isdisjoint(flags))
+        top_level = next(action for action in parser._actions
+                         if isinstance(action, argparse._SubParsersAction))
+        item = top_level.choices["item"]
+        item_commands = next(action for action in item._actions
+                             if isinstance(action, argparse._SubParsersAction))
+        self.assertNotIn("--field", set(options(item_commands.choices["put-login"])))
+        with tempfile.TemporaryDirectory() as td:
+            canary = "removed-argv-password-canary"
+            rejected = self.run_cli(Path(td), "item", "put-login", "--vault", "agents",
+                                    "--title", "dummy", f"--password={canary}", ok=False)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertNotIn(canary, rejected.stdout + rejected.stderr)
+
+    def test_wrong_stdin_master_reports_clean_auth_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            self.run_cli(state, "init", "--master-password-stdin", stdin=MASTER + "\n")
+            canary = "wrong-master-canary"
+            rejected = self.run_cli(state, "serve", "--master-password-stdin",
+                                    stdin=canary + "\n", ok=False)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(rejected.stdout, "")
+            self.assertEqual(rejected.stderr, "passd: auth_error: invalid master password\n")
+            self.assertFalse((state / "passd.sock").exists())
 
     def test_real_daemon_and_cli_zero_grant_hitl_flow(self):
         with tempfile.TemporaryDirectory() as td:
@@ -56,7 +97,29 @@ class CliProcessE2E(unittest.TestCase):
                     self.fail("daemon socket did not appear")
 
                 self.run_cli(state, "vault", "create", "Personal")
-                self.run_cli(state, "item", "put-login", "--vault", "Personal", "--title", "API", "--password", "process-secret")
+                secret = " process-secret "
+                result = self.run_cli(
+                    state, "item", "put-login", "--vault", "Personal", "--title", "API",
+                    "--master-password-stdin", "--password-stdin", "--field-stdin", "pin",
+                    stdin=MASTER + "\n" + secret + "\nfield-canary\n",
+                )
+                for canary in (MASTER, secret, "field-canary"):
+                    self.assertNotIn(canary, result.stdout + result.stderr)
+                result = self.run_cli(state, "resolve", "pass://Personal/API/password",
+                                      "--master-password-stdin", stdin=MASTER + "\n")
+                self.assertEqual(json.loads(result.stdout), secret)
+
+                password_file = Path(td) / "password"
+                password_file.write_text("file-canary\n")
+                password_file.chmod(0o640)
+                put_args = ("item", "put-login", "--vault", "Personal", "--title", "file",
+                            "--password-file", str(password_file))
+                rejected = self.run_cli(state, *put_args, ok=False)
+                self.assertIn("mode 0600", rejected.stderr)
+                self.assertNotIn("file-canary", rejected.stdout + rejected.stderr)
+                password_file.chmod(0o600)
+                result = self.run_cli(state, *put_args)
+                self.assertNotIn("file-canary", result.stdout + result.stderr)
                 agent = json.loads(self.run_cli(state, "agent", "create", "cli-agent", "--scope", "access.request", "--scope", "metadata.read", "--scope", "secret.use", "--expiration", "1h").stdout)
                 token = agent["token"]
                 agent_env = {"PASSD_AGENT_TOKEN": token, "PASSD_AGENT_REASON": "process e2e"}
@@ -128,7 +191,7 @@ def _test_capability_cli_process(self):
             else: self.fail("daemon socket did not appear")
 
             self.run_cli(state, "vault", "create", "Personal")
-            self.run_cli(state, "item", "put-login", "--vault", "Personal", "--title", "OpenRouter", "--password", _CapHandler.secret)
+            self.run_cli(state, "item", "put-login", "--vault", "Personal", "--title", "OpenRouter", "--password-stdin", stdin=_CapHandler.secret + "\n")
             cap = json.loads(self.run_cli(
                 state, "capability", "put-http", "openrouter.infer",
                 "--description", "Inference", "--backing-uri", "pass://Personal/OpenRouter/password",

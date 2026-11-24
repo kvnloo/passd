@@ -53,14 +53,14 @@ class PassdUnixServer(socketserver.ThreadingUnixStreamServer):
     # during a burst, before the accept loop can start their handler threads.
     request_queue_size = 128
 
-    def __init__(self, socket_path: Path, service):
+    def __init__(self, socket_path: Path, service, *, socket_mode: int = 0o600):
         self.socket_path = socket_path
         self.service = service
         if socket_path.exists():
             socket_path.unlink()
         socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         super().__init__(str(socket_path), PassdHandler)
-        os.chmod(socket_path, 0o600)
+        os.chmod(socket_path, socket_mode)
 
     def server_close(self):
         super().server_close()
@@ -74,8 +74,8 @@ class PassdUnixServer(socketserver.ThreadingUnixStreamServer):
         logger.error("%s", type(sys.exception()).__name__)
 
 
-def serve(socket_path: Path, service):
-    server = PassdUnixServer(socket_path, service)
+def serve(socket_path: Path, service, *, socket_mode: int = 0o600):
+    server = PassdUnixServer(socket_path, service, socket_mode=socket_mode)
     stop = threading.Event()
 
     def handle_signal(signum, frame):
