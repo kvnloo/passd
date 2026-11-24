@@ -3,17 +3,21 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
-from .client import PassdClient, RpcError
+from .client import PassdClient, RpcError, parse_endpoint
 from .config import Config, default_data_dir
 from .db import connect
-from .errors import PassdError
+from .errors import INTERNAL_ERROR_MESSAGE, PassdError
+from .gateway import DEFAULT_MAX_CONNECTIONS, serve_gateway
 from .proton_import import import_export
 from .server import serve
 from .service import DEFAULT_ACCESS_TTL, PassdService
+
+logger = logging.getLogger(__name__)
 
 
 def password_from_env(*, confirm: bool = False, prompt: str = "Master password: ") -> str:
@@ -31,6 +35,24 @@ def password_from_env(*, confirm: bool = False, prompt: str = "Master password: 
 
 def agent_token(args) -> str | None:
     return getattr(args, "agent_token", None) or os.environ.get("PASSD_AGENT_TOKEN")
+
+
+def read_pat_stdin() -> str:
+    """Read only stdin, disabling terminal echo without opening /dev/tty."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline(65538).removesuffix("\n").removesuffix("\r")
+    import termios
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    hidden = list(previous)
+    hidden[3] &= ~termios.ECHO
+    print("Proton agent PAT: ", end="", file=sys.stderr, flush=True)
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, hidden)
+        return sys.stdin.readline(65538).removesuffix("\n").removesuffix("\r")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        print(file=sys.stderr)
 
 
 def reason(args) -> str | None:
@@ -55,6 +77,8 @@ def output(value, *, raw: bool = False):
 
 
 def get_client(data_dir: Path) -> PassdClient:
+    if os.environ.get("PASSD_REMOTE"):
+        return PassdClient()
     cfg = Config.load(data_dir)
     return PassdClient(cfg.socket_path)
 
@@ -71,7 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="initialize encrypted storage")
     x = sub.add_parser("serve", help="run the local Unix-socket daemon")
     x.add_argument("--allow-private-broker-targets", action="store_true", help="allow broker requests to private/loopback IPs (development only)")
+    g = sub.add_parser("gateway", help="forward agent-only TCP requests to the local daemon")
+    g.add_argument("--listen", required=True, type=parse_endpoint, metavar="HOST:PORT")
+    g.add_argument("--allow-cidr", action="append", help="allowed source CIDR; repeatable, replaces tailnet/loopback defaults")
+    g.add_argument("--i-know-what-im-doing", action="store_true", help="permit binding to all interfaces")
+    g.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS, help="maximum concurrent gateway connections (default: 32)")
     sub.add_parser("doctor", help="check configuration and daemon")
+    pa = sub.add_parser("proton-agent", help="admin: manage the isolated Proton agent source")
+    pas = pa.add_subparsers(dest="proton_agent_command", required=True)
+    for command in ("set-pat", "login", "status", "logout", "disable", "enable"):
+        pas.add_parser(command)
 
     v = sub.add_parser("vault", help="vault operations")
     vs = v.add_subparsers(dest="vault_command", required=True)
@@ -127,7 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
     put = cps.add_parser("put-http", help="admin: create/update an HTTP capability backed by one secret field")
     put.add_argument("capability_id")
     put.add_argument("--description", default="")
-    put.add_argument("--backing-uri", required=True, help="admin-only pass://VAULT/ITEM/FIELD backing selector")
+    put.add_argument("--source", choices=["stored", "proton-agent"], default="stored")
+    put.add_argument("--backing-uri", help="admin-only pass://VAULT/ITEM/FIELD backing selector")
+    put.add_argument("--share-id")
+    put.add_argument("--item-id")
+    put.add_argument("--vault-name")
+    put.add_argument("--item-title")
+    put.add_argument("--field")
     put.add_argument("--scheme", choices=["http", "https"], default="https")
     put.add_argument("--host", required=True)
     put.add_argument("--port", type=int)
@@ -236,10 +275,32 @@ def main(argv=None) -> int:
             serve(cfg.socket_path, service)
             return 0
 
+        if args.command == "gateway":
+            socket_path = Path(os.environ["PASSD_SOCKET"]).expanduser() if os.environ.get("PASSD_SOCKET") else Config.load(data_dir).socket_path
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+            serve_gateway(socket_path, args.listen, allow_cidrs=args.allow_cidr, i_know_what_im_doing=args.i_know_what_im_doing, max_connections=args.max_connections)
+            return 0
+
         client = get_client(data_dir)
+        if client.remote and not (
+            args.command == "capability" and args.capability_command in {"list", "request", "invoke"}
+            or args.command == "access" and args.access_command in {"request", "status"}
+        ):
+            raise RpcError("forbidden_remote_op", "remote CLI commands require the agent-only gateway API")
         if args.command == "doctor":
             cfg = Config.load(data_dir)
             output({"data_dir": str(cfg.data_dir), "socket": str(cfg.socket_path), "daemon": client.call("health")})
+            return 0
+
+        if args.command == "proton-agent":
+            admin = password_from_env()
+            params = {}
+            try:
+                if args.proton_agent_command == "set-pat":
+                    params["pat"] = read_pat_stdin()
+                output(client.call("proton-agent." + args.proton_agent_command, params, admin_password=admin))
+            finally:
+                params.clear()
             return 0
 
         if args.command == "vault":
@@ -282,7 +343,7 @@ def main(argv=None) -> int:
         if args.command == "capability":
             if args.capability_command == "list":
                 token = agent_token(args)
-                output(client.call("capability.list", agent_token=token) if token else client.call("capability.list", admin_password=password_from_env()))
+                output(client.call("capability.list", agent_token=token) if token or client.remote else client.call("capability.list", admin_password=password_from_env()))
             elif args.capability_command == "get":
                 output(client.call("capability.get", {"id": args.capability_id}, admin_password=password_from_env()))
             elif args.capability_command == "put-http":
@@ -290,6 +351,7 @@ def main(argv=None) -> int:
                     "id": args.capability_id,
                     "description": args.description,
                     "kind": "http_secret",
+                    "source": args.source,
                     "backing_uri": args.backing_uri,
                     "scheme": args.scheme,
                     "host": args.host,
@@ -300,6 +362,9 @@ def main(argv=None) -> int:
                     "static_headers": kv_pairs(args.static_header),
                     "timeout_seconds": args.timeout,
                 }
+                ref = {key: getattr(args, key) for key in ("share_id", "item_id", "vault_name", "item_title", "field") if getattr(args, key) is not None}
+                if ref:
+                    params["ref"] = ref
                 if args.port is not None:
                     params["port"] = args.port
                 output(client.call("capability.put", params, admin_password=password_from_env()))
@@ -358,13 +423,18 @@ def main(argv=None) -> int:
             return 0
 
         if args.command == "sync":
+            print("passd: warning: Proton ZIP import is deprecated; use the live proton-agent source. Import remains available for optional legacy migration.", file=sys.stderr)
             result = import_export(client, args.path, admin_password=password_from_env())
             output(result)
             return 0
         return 2
-    except (PassdError, RpcError, ValueError, OSError, json.JSONDecodeError) as exc:
-        code = getattr(exc, "code", "error")
-        print(f"passd: {code}: {exc}", file=sys.stderr)
+    except Exception as exc:
+        if isinstance(exc, PassdError) and exc.code != "internal_error":
+            code, message = exc.code, str(exc)
+        else:
+            logger.error("%s", type(exc).__name__)
+            code, message = "internal_error", INTERNAL_ERROR_MESSAGE
+        print(f"passd: {code}: {message}", file=sys.stderr)
         return 2
 
 

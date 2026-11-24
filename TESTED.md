@@ -1,5 +1,38 @@
 # v0.3.1 test evidence
 
+## Remote gateway tests
+
+`tests/test_gateway.py` adds pytest coverage for:
+
+- real Unix daemon -> loopback TCP gateway -> local HTTP echo flow, with local
+  approval and byte-level checks that the injected dummy secret never reaches
+  the TCP client;
+- refusal of admin/other operations, missing or malformed agent tokens, and
+  admin passwords at top level or nested in params, including duplicate JSON keys;
+- deny, revoke, lease expiry, and use-budget exhaustion over TCP;
+- default IPv4/IPv6 CIDRs, IPv4-mapped addresses, replacement allowlists, and
+  rejected peer connections;
+- wildcard-bind guards, 1 MiB framing limits, idle timeouts, malformed requests,
+  persistent sessions, and logs containing only metadata;
+- `PASSD_REMOTE` Python clients and agent CLI commands without local vault
+  configuration, plus gateway CLI options and `PASSD_SOCKET`.
+
+These tests use loopback connections only, not a live Tailscale deployment.
+On 2026-10-15, the full suite was run offline with `UV_OFFLINE=1` and a writable
+`UV_CACHE_DIR` under `/tmp`:
+
+```bash
+uv run -q --with pytest --with 'cryptography>=45' python -m pytest -q tests
+```
+
+Result: **22 passed, 46 failed, 40 setup errors**. The gateway module accounts for
+18 passes and 40 setup errors. The sandbox denies socket `setsockopt` operations
+with `EPERM`, blocking both existing socket tests and the new live gateway tests.
+A supplementary in-memory transport smoke passed filtering, persistent
+forwarding, real service approval/redaction/use-budget enforcement, and the
+client admin-password guard. This is not a passing live integration receipt.
+The historical results below predate the gateway.
+
 Validated on 2026-09-20 in the build container. Tests were deliberately run in bounded groups because the execution harness terminates long combined shell commands; no truncated run is counted as success.
 
 ## Backend: 50 tests

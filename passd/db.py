@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS items (
 );
 CREATE INDEX IF NOT EXISTS idx_items_vault ON items(vault_id);
 
+CREATE TABLE IF NOT EXISTS internal_secrets (
+    name TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS capabilities (
     id TEXT PRIMARY KEY,
     version TEXT NOT NULL,

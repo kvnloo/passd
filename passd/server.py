@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import socketserver
+import sys
 import threading
 from pathlib import Path
 
-from .errors import PassdError
+from .errors import INTERNAL_ERROR_MESSAGE, PassdError
 
 MAX_REQUEST = 2 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class PassdHandler(socketserver.StreamRequestHandler):
@@ -28,9 +31,15 @@ class PassdHandler(socketserver.StreamRequestHandler):
                 result = self.server.service.handle(request)
                 self._send({"ok": True, "result": result})
             except PassdError as exc:
-                self._send({"ok": False, "error": {"code": exc.code, "message": str(exc)}})
+                if exc.code == "internal_error":
+                    logger.error("%s", type(exc).__name__)
+                    message = INTERNAL_ERROR_MESSAGE
+                else:
+                    message = str(exc)
+                self._send({"ok": False, "error": {"code": exc.code, "message": message}})
             except Exception as exc:
-                self._send({"ok": False, "error": {"code": "internal_error", "message": str(exc)}})
+                logger.error("%s", type(exc).__name__)
+                self._send({"ok": False, "error": {"code": "internal_error", "message": INTERNAL_ERROR_MESSAGE}})
 
     def _send(self, value):
         self.wfile.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
@@ -56,6 +65,10 @@ class PassdUnixServer(socketserver.ThreadingUnixStreamServer):
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
+
+    def handle_error(self, request, client_address):
+        # Never let socketserver print exception text or a traceback.
+        logger.error("%s", type(sys.exception()).__name__)
 
 
 def serve(socket_path: Path, service):

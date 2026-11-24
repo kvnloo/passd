@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Optional legacy snapshot bridge. Prefer the scoped live proton-agent source.
+
 import json
 import uuid
 import zipfile

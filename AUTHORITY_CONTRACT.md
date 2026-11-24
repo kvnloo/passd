@@ -50,6 +50,13 @@ At approval, `passd` resolves the current backing credential and stores a second
 
 This is the shape a future phone/hardware signer should sign. v0.3 still uses trusted admin/HITL command authentication; signature transport is deliberately deferred.
 
+For `source: "proton-agent"`, the credential-version slot binds a root-keyed
+version of the source/ref and configured Proton agent name. Approval performs no
+Proton read. Each invocation resolves the current granted field only after the
+existing authority checks, atomic budget claim, and destination validation. Live
+remote rotation takes effect on the next call; changing the capability source/ref
+invalidates its lease. Stored credentials retain the exact-value binding above.
+
 ## Provider isolation
 
 A provider owns custody/execution, not policy invention.

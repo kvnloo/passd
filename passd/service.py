@@ -4,10 +4,12 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import secrets
 import socket
-import time
+import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,7 +20,8 @@ from .authority import CAPABILITY_ID_RE, authority_digest, capability_version, c
 from .config import Config
 from .crypto import open_json, open_sealed, random_key, seal, seal_json
 from .db import connect
-from .errors import AuthError, Conflict, NotFound, PermissionDenied, ValidationError
+from .errors import AuthError, Conflict, NotFound, PermissionDenied, ProtonAgentDenial, ValidationError
+from .proton_agent import PAT_NAME, STATE_NAME, ProtonAgentSource, validate_ref
 from .refs import parse_pass_ref
 
 MAX_REASON_LENGTH = 300
@@ -64,6 +67,14 @@ class PassdService:
         self.db = connect(config.db_path)
         self.allow_private_broker_targets = allow_private_broker_targets
         self._db_lock = threading.RLock()
+        self.proton_agent = ProtonAgentSource(
+            config.data_dir / "proton-agent", binary=config.proton_agent_binary,
+            agent_name=config.proton_agent_name, timeout=config.proton_agent_timeout,
+            get_pat=lambda: self._get_internal_secret(PAT_NAME),
+            get_state=lambda: self._get_internal_secret(STATE_NAME) or {},
+            set_state=lambda state: self._put_internal_secret(STATE_NAME, state),
+            alert=self._proton_agent_alert,
+        )
         # Reuse one transport. Building urllib opener/handlers per invocation
         # dominated local policy latency by orders of magnitude.
         self._http_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
@@ -139,6 +150,49 @@ class PassdService:
 
     def _seal_access_payload(self, request_id: str, payload: dict) -> str:
         return seal_json(self.root_key, payload, aad=f"passd/access/{request_id}/payload".encode())
+
+    def _put_internal_secret(self, name: str, value: Any):
+        payload = seal_json(self.root_key, value, aad=f"passd/internal/{name}".encode())
+        with self._db_lock:
+            self.db.execute(
+                "INSERT INTO internal_secrets(name,payload) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
+                (name, payload),
+            )
+            self.db.commit()
+
+    def _get_internal_secret(self, name: str):
+        with self._db_lock:
+            row = self.db.execute("SELECT payload FROM internal_secrets WHERE name=?", (name,)).fetchone()
+            return open_json(self.root_key, row["payload"], aad=f"passd/internal/{name}".encode()) if row else None
+
+    def set_proton_agent_pat(self, pat: str) -> dict:
+        if not isinstance(pat, str) or not pat or len(pat) > 65536 or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in pat):
+            raise ValidationError("PAT must be a nonempty token without whitespace or control characters")
+        self._put_internal_secret(PAT_NAME, pat)
+        return {"pat_set": True}
+
+    def _proton_agent_alert(self, detail: dict):
+        event = "proton_agent.auth_expired"
+        try:
+            self.audit(None, event, None, None, None, False, detail)
+        except Exception:
+            pass
+        try:
+            fd = os.open(self.config.data_dir / "alerts.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(json_dumps({"ts": now(), "event": event, **detail}) + "\n")
+        except OSError:
+            pass
+        if self.config.alert_command:
+            try:
+                subprocess.run(
+                    self.config.alert_command, shell=False, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                    env={"PATH": os.environ.get("PATH", os.defpath), "HOME": str(self.config.data_dir),
+                         "LANG": "C.UTF-8", "PASSD_ALERT_EVENT": event},
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     # ---------- vaults ----------
     def create_vault(self, name: str, description: str = "", *, source: dict | None = None) -> dict:
@@ -324,10 +378,23 @@ class PassdService:
         if len(description) > 300:
             raise ValidationError("capability description must be <= 300 characters")
 
-        backing_uri = str(raw.get("backing_uri") or "").strip()
-        _, _, field = parse_pass_ref(backing_uri)
-        if not field:
-            raise ValidationError("capability backing_uri must name one exact field")
+        source = raw.get("source", "stored")
+        if source == "proton-agent":
+            if raw.get("backing_uri"):
+                raise ValidationError("proton-agent capabilities must use ref only")
+            backing = {"source": source, "ref": validate_ref(raw.get("ref"))}
+        elif source == "stored":
+            if raw.get("ref"):
+                raise ValidationError("stored capabilities must use backing_uri only")
+            backing_uri = str(raw.get("backing_uri") or "").strip()
+            vault, item, field = parse_pass_ref(backing_uri)
+            if {vault, item, field}.intersection({PAT_NAME, STATE_NAME}):
+                raise ValidationError("internal custody records cannot back capabilities")
+            if not field:
+                raise ValidationError("capability backing_uri must name one exact field")
+            backing = {"backing_uri": backing_uri}
+        else:
+            raise ValidationError("unsupported capability secret source")
 
         scheme = str(raw.get("scheme") or "https").strip().lower()
         if scheme not in {"http", "https"}:
@@ -375,7 +442,7 @@ class PassdService:
             "id": capability_id,
             "description": description,
             "kind": kind,
-            "backing_uri": backing_uri,
+            **backing,
             "scheme": scheme,
             "host": host,
             "port": port,
@@ -837,9 +904,15 @@ class PassdService:
                     raise Conflict("capability changed after request; request again")
                 definition = self._capability_payload(cap_row)
                 self._validate_capability_invocation(definition, payload["method"], payload["path"])
-                item_row, field = self.resolve_item_ref(definition["backing_uri"])
-                self._extract_field(self._item_payload(item_row), field)
-                payload["approved_credential_version"] = self._credential_version(item_row, field)
+                if definition.get("source") == "proton-agent":
+                    item_row = None
+                    # Live sources approve the selector, never fetch a credential
+                    # before budget consumption and destination validation.
+                    payload["approved_credential_version"] = self._live_source_version(definition)
+                else:
+                    item_row, field = self.resolve_item_ref(definition["backing_uri"])
+                    self._extract_field(self._item_payload(item_row), field)
+                    payload["approved_credential_version"] = self._credential_version(item_row, field)
                 payload["approved_capability_version"] = cap_row["version"]
                 audit_detail = {
                     "request_id": request_id,
@@ -879,7 +952,7 @@ class PassdService:
                 "UPDATE access_requests SET payload=?,status='approved',item_id=?,expires_at=?,max_uses=?,uses=0,reviewed_at=? WHERE id=? AND status='pending'",
                 (
                     self._seal_access_payload(request_id, payload),
-                    item_row["id"],
+                    item_row["id"] if item_row else None,
                     reviewed + approved_ttl,
                     approved_uses,
                     reviewed,
@@ -1041,15 +1114,18 @@ class PassdService:
                     self.db.commit()
                     continue
                 item_row = self.db.execute("SELECT * FROM items WHERE id=?", (row["item_id"],)).fetchone() if row["item_id"] else None
-                field = parse_pass_ref(definition["backing_uri"])[2]
+                live = definition.get("source") == "proton-agent"
+                field = definition["ref"]["field"] if live else parse_pass_ref(definition["backing_uri"])[2]
                 item_payload = self._item_payload(item_row) if item_row else None
                 approved_credential_version = payload.get("approved_credential_version")
-                if item_payload is not None:
+                if live:
+                    current_credential_version = self._live_source_version(definition)
+                elif item_payload is not None:
                     secret_value = self._extract_field(item_payload, field)
                     current_credential_version = credential_version(self.root_key, item_id=item_row["id"], field=field, value=secret_value)
                 else:
                     current_credential_version = None
-                if not item_row or not approved_credential_version or not current_credential_version or not hmac.compare_digest(approved_credential_version, current_credential_version):
+                if not approved_credential_version or not current_credential_version or not hmac.compare_digest(approved_credential_version, current_credential_version):
                     self.db.execute(
                         "UPDATE access_requests SET status='stale',reviewed_at=? WHERE id=? AND status='approved'",
                         (ts, row["id"]),
@@ -1065,8 +1141,17 @@ class PassdService:
                     continue
                 return row, cap_row, definition, item_row, field, item_payload
 
-        self.audit(agent["id"], "capability.invoke", None, definition["host"], reason, False, {"capability_id": cap_row["id"], "why": "no_active_hitl_lease"})
+        self.audit(agent["id"], "capability.invoke", None, definition["host"], reason, False, {
+            "capability_id": cap_row["id"], "lease_id": None, "source": definition.get("source", "stored"),
+            "outcome": "denied", "denial_type": "PermissionDenied", "why": "no_active_hitl_lease",
+        })
         raise PermissionDenied("no active HITL lease for this exact capability request")
+
+    def _live_source_version(self, definition: dict) -> str:
+        return capability_version(self.root_key, {
+            "source": definition["source"], "ref": definition["ref"],
+            "agent_name": self.config.proton_agent_name,
+        })
 
     def list_authorized_vaults(self, agent) -> list[dict]:
         self._require_agent_scope(agent, "metadata.read")
@@ -1237,10 +1322,6 @@ class PassdService:
         grant, cap_row, definition, item_row, field, item_payload = self._consume_capability_grant(
             agent, capability_id, method, path, reason
         )
-        secret_value = self._extract_field(item_payload, field)
-        if not isinstance(secret_value, (str, int, float)):
-            raise ValidationError("capability secret field must be a scalar value")
-        secret_text = str(secret_value)
         method, path = self._validate_capability_invocation(definition, method, path)
 
         default_port = 443 if definition["scheme"] == "https" else 80
@@ -1248,16 +1329,34 @@ class PassdService:
         url = f"{definition['scheme']}://{definition['host']}{port_suffix}{path}"
         self._validate_target(url, agent=agent)
 
+        source = definition.get("source", "stored")
+        detail = {"capability_id": cap_row["id"], "lease_id": grant["id"], "source": source}
+        try:
+            if source == "proton-agent":
+                secret_value = self.proton_agent.resolve(
+                    cap_row["id"], grant["id"], definition["ref"], purpose=definition.get("description", "")
+                )
+            else:
+                secret_value = self._extract_field(item_payload, field)
+        except ProtonAgentDenial as exc:
+            self.audit(agent["id"], "capability.invoke", None, definition["host"], reason, False,
+                       {**detail, "outcome": "denied", "denial_type": type(exc).__name__})
+            raise
         headers = dict(definition.get("static_headers") or {})
-        headers[definition["inject_header"]] = definition.get("inject_prefix", "") + secret_text
-        result = self._execute_http(
-            url,
-            method=method,
-            headers=headers,
-            body=body,
-            secret_text=secret_text,
-            timeout=float(definition.get("timeout_seconds", 20.0)),
-        )
+        secret_text = ""
+        try:
+            if not isinstance(secret_value, (str, int, float)):
+                raise ValidationError("capability secret field must be a scalar value")
+            secret_text = self._validate_header_value(str(secret_value))
+            headers[definition["inject_header"]] = definition.get("inject_prefix", "") + secret_text
+            result = self._execute_http(
+                url, method=method, headers=headers, body=body, secret_text=secret_text,
+                timeout=float(definition.get("timeout_seconds", 20.0)),
+            )
+        finally:
+            headers.clear()
+            secret_text = ""
+            del secret_value, secret_text
         self.audit(
             agent["id"],
             "capability.invoke",
@@ -1266,6 +1365,8 @@ class PassdService:
             reason,
             True,
             {
+                **detail,
+                "outcome": "allowed",
                 "request_id": grant["id"],
                 "capability_id": cap_row["id"],
                 "capability_version": cap_row["version"],
@@ -1337,6 +1438,15 @@ class PassdService:
 
         if op == "health":
             return {"ok": True, "version": 3}
+
+        if op in {"proton-agent.set-pat", "proton-agent.login", "proton-agent.status",
+                  "proton-agent.logout", "proton-agent.disable", "proton-agent.enable"}:
+            if token:
+                raise PermissionDenied("Proton agent administration requires the local admin path")
+            self.verify_admin_password(admin)
+            if op == "proton-agent.set-pat":
+                return self.set_proton_agent_pat(p["pat"])
+            return getattr(self.proton_agent, op.split(".")[1])()
 
         if op == "vault.list":
             if token:

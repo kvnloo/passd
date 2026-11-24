@@ -63,6 +63,11 @@ This means:
 
 The approval record stores a second digest binding request digest + capability version + credential version + narrowed budget.
 
+For the [live Proton agent source](PROTON_AGENT.md), approval instead binds the
+source/ref and configured agent name. Proton is read only after lease consumption
+and destination validation. Each invocation reads the current granted field;
+remote rotation does not stale an existing live lease. Source/ref changes do.
+
 ## Atomic use budgets
 
 A use is claimed through a conditional SQLite update before the provider operation runs. One-use concurrency tests assert exactly one winner across eight simultaneous callers.
@@ -108,10 +113,20 @@ Encrypted with AES-256-GCM under the passd root-key hierarchy:
 - pending request private fields/reasons;
 - HITL notes;
 - audit reason/detail payloads.
+- internal Proton agent PAT and source state, outside the vault/item namespace.
 
 Machine-token plaintext secrets are never stored, only SHA-256 verifiers of high-entropy random token material.
 
 Indexed plaintext is limited to operational metadata such as opaque IDs, timestamps, status, operation class, destination host, use counters, and opaque versions/digests.
+
+The live source uses an owner-only isolated AGENT session and a minimal subprocess
+environment. The PAT goes only to login, and item reads carry capability/lease
+reasons. Internal PATs have no reveal/list/export RPC or capability selector.
+Source denials never fall back or retry login. Auth expiry emits credential-free
+alerts; `proton-agent disable` persists the kill switch and wipes the session.
+The pass-cli session files are authentication material protected by filesystem
+permissions; passd's database encryption does not encrypt those files. ZIP import
+is deprecated and optional.
 
 ## Same-host root limitation
 
