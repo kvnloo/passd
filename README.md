@@ -92,6 +92,14 @@ The local daemon uses an owner-only Unix socket (`0600`). Data directory is `070
 
 For high-assurance use, do **not** colocate custody with coding agents. See [`REMOTE_CUSTODY.md`](REMOTE_CUSTODY.md).
 
+## Enroll the live Proton source
+
+On the trusted custody host with the broker running, run `passd enroll proton`
+and open the Proton web login URL it prints. The command creates a one-week
+agent restricted to viewer access on the `agents` vault and verifies the
+broker session. See [Proton enrollment and rotation](spec/PROTON-ENROLLMENT.md)
+for prerequisites, renewal, and revocation.
+
 ## Optional legacy import
 
 ```bash
