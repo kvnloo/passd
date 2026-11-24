@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "steps": [
+    {
+      "now": 1000,
+      "operation": "request",
+      "inputs": {},
+      "expect": {
+        "status": "pending"
+      }
+    },
+    {
+      "now": 1000,
+      "operation": "approve",
+      "inputs": {},
+      "expect": {
+        "status": "approved",
+        "expires_at": 1060,
+        "uses_remaining": 1
+      }
+    },
+    {
+      "now": 1000,
+      "operation": "invoke",
+      "inputs": {
+        "path": "/v1/other"
+      },
+      "expect": {
+        "error": "permission_denied"
+      }
+    },
+    {
+      "now": 1000,
+      "operation": "invoke",
+      "inputs": {
+        "method": "GET"
+      },
+      "expect": {
+        "error": "permission_denied"
+      }
+    },
+    {
+      "now": 1000,
+      "operation": "status",
+      "inputs": {},
+      "expect": {
+        "uses_remaining": 1
+      }
+    },
+    {
+      "now": 1000,
+      "operation": "invoke",
+      "inputs": {},
+      "expect": {
+        "status": 204
+      }
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "steps": [
+    {
+      "now": 1000,
+      "operation": "invoke",
+      "inputs": {},
+      "expect": {
+        "error": "permission_denied"
+      }
+    }
+  ]
+}
