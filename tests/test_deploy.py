@@ -13,11 +13,17 @@ DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 
 def test_deploy_units(tmp_path):
     def read_unit(name):
-        config = configparser.ConfigParser(interpolation=None)
+        # systemd allows repeated keys (e.g. allow + deny SystemCallFilter lines); configparser must too.
+        config = configparser.ConfigParser(interpolation=None, strict=False)
         assert config.read(DEPLOY / name)
         service = config["Service"]
-        for key in ("NoNewPrivileges", "ProtectHome", "PrivateTmp", "MemoryDenyWriteExecute"):
+        for key in ("NoNewPrivileges", "ProtectHome", "PrivateTmp", "MemoryDenyWriteExecute",
+                    "PrivateDevices", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups",
+                    "RestrictNamespaces", "RestrictSUIDSGID", "LockPersonality"):
             assert service[key] == "yes"
+        assert service["CapabilityBoundingSet"] == ""
+        raw = (DEPLOY / name).read_text()
+        assert "SystemCallFilter=@system-service" in raw and "SystemCallFilter=~@privileged @resources" in raw
         assert service["ProtectSystem"] == "strict"
         assert set(service["RestrictAddressFamilies"].split()) == {"AF_UNIX", "AF_INET", "AF_INET6"}
         assert service["ExecStart"].startswith("/opt/passd/bin/passd ")
