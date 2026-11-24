@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,19 @@ class CheckFailed(Exception):
 def require(condition: bool) -> None:
     if not condition:
         raise CheckFailed
+
+
+def _short_tmp_dir() -> str | None:
+    """/tmp keeps AF_UNIX paths short; fall back to the default temp dir when /tmp is unusable."""
+    override = os.environ.get("PASSD_READY_DIR")
+    if override:
+        return override
+    try:
+        if os.access("/tmp", os.W_OK) and shutil.disk_usage("/tmp").free >= 16 * 1024 * 1024:
+            return "/tmp"
+    except OSError:
+        pass
+    return None
 
 
 @contextmanager
@@ -186,8 +200,9 @@ def main() -> int:
                 master = read_secret_line()
             exercise(args.socket, master, state=None, gateway=args.gateway)
         else:
-            # Keep the Unix socket path short on macOS.
-            with tempfile.TemporaryDirectory(prefix="passd-ready-", dir="/tmp") as directory:
+            # Keep the Unix socket path short on macOS, but don't depend on /tmp having space
+            # (a full tmpfs /tmp made init fail on Linux hosts).
+            with tempfile.TemporaryDirectory(prefix="passd-ready-", dir=_short_tmp_dir()) as directory:
                 state = Path(directory)
                 exercise(state / "passd.sock", "readiness-dummy-master-" + uuid.uuid4().hex,
                          state=state, gateway=None)
