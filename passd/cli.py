@@ -96,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--url", action="append", default=[])
     c.add_argument("--field", action="append", default=[], metavar="NAME=VALUE")
     c.add_argument("--note", default="")
+    gi = ins.add_parser("import-google-sa", help="admin: validate and store a Google service-account JSON key")
+    gi.add_argument("--vault", required=True)
+    gi.add_argument("--title", required=True)
+    gi.add_argument("--key-file", type=Path, required=True, help="service-account JSON key file (delete it after import)")
+    gi.add_argument("--note", default="")
     vw = ins.add_parser("view")
     vw.add_argument("uri")
     vw.add_argument("--agent-token")
@@ -137,10 +142,26 @@ def build_parser() -> argparse.ArgumentParser:
     put.add_argument("--inject-prefix", default="Bearer ")
     put.add_argument("--static-header", action="append", default=[], metavar="NAME=VALUE")
     put.add_argument("--timeout", type=float, default=20.0)
+    gs = cps.add_parser("put-google-sa", help="admin: create/update a Google service-account capability (OAuth minted in custody)")
+    gs.add_argument("capability_id")
+    gs.add_argument("--description", default="")
+    gs.add_argument("--backing-uri", required=True, help="admin-only pass://VAULT/ITEM/service_account_json selector")
+    gs.add_argument("--scope", action="append", default=[], help="OAuth scope; repeatable (e.g. https://www.googleapis.com/auth/cloud-platform)")
+    gs.add_argument("--host", action="append", default=[], help="allowed *.googleapis.com host; repeatable")
+    gs.add_argument("--method", action="append", default=[], help="allowed HTTP method; repeatable")
+    gs.add_argument("--path-prefix", action="append", default=[], help="allowed path prefix; repeatable")
+    gs.add_argument("--response-secret-field", action="append", default=None, help="JSON response field moved into custody and redacted; repeatable (default: keyString, privateKeyData)")
+    gs.add_argument("--no-response-secret-fields", action="store_true", help="disable response secret capture (not recommended)")
+    gs.add_argument("--reveal-response-secrets", action="store_true", help="store minted secrets AND return them to the agent")
+    gs.add_argument("--response-secret-vault", help="vault for minted secrets (default: backing vault)")
+    gs.add_argument("--timeout", type=float, default=20.0)
     cr = cps.add_parser("request", help="agent: request a short-lived lease for one exact capability invocation")
     cr.add_argument("capability_id")
     cr.add_argument("--method", default="POST")
     cr.add_argument("--path", required=True)
+    cr.add_argument("--host", help="exact target host (required when a capability spans several hosts)")
+    cr.add_argument("--body", help="exact request body; google_service_account leases bind its hash")
+    cr.add_argument("--body-file", type=Path)
     cr.add_argument("--expiration", default="5m")
     cr.add_argument("--uses", type=int, default=1)
     cr.add_argument("--agent-token")
@@ -149,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("capability_id")
     ci.add_argument("--method", default="POST")
     ci.add_argument("--path", required=True)
+    ci.add_argument("--host")
     ci.add_argument("--body")
     ci.add_argument("--body-file", type=Path)
     ci.add_argument("--agent-token")
@@ -262,6 +284,9 @@ def main(argv=None) -> int:
                 if password is None: password = getpass.getpass("Secret password/API key: ")
                 fields["password"] = password
                 output(client.call("item.put", {"vault": args.vault, "title": args.title, "type": "login", "fields": fields, "urls": args.url, "note": args.note}, admin_password=password_from_env()))
+            elif args.item_command == "import-google-sa":
+                key_json = args.key_file.expanduser().read_text()
+                output(client.call("google_sa.import", {"vault": args.vault, "title": args.title, "key_json": key_json, "note": args.note}, admin_password=password_from_env()))
             else:
                 token = agent_token(args)
                 kwargs = {"agent_token": token, "reason": reason(args)} if token else {"admin_password": password_from_env()}
@@ -303,16 +328,42 @@ def main(argv=None) -> int:
                 if args.port is not None:
                     params["port"] = args.port
                 output(client.call("capability.put", params, admin_password=password_from_env()))
+            elif args.capability_command == "put-google-sa":
+                params = {
+                    "id": args.capability_id,
+                    "description": args.description,
+                    "kind": "google_service_account",
+                    "backing_uri": args.backing_uri,
+                    "scopes": args.scope,
+                    "hosts": args.host,
+                    "methods": args.method or ["POST"],
+                    "path_prefixes": args.path_prefix,
+                    "timeout_seconds": args.timeout,
+                    "response_secret_reveal": bool(args.reveal_response_secrets),
+                }
+                if args.no_response_secret_fields:
+                    params["response_secret_fields"] = []
+                elif args.response_secret_field:
+                    params["response_secret_fields"] = args.response_secret_field
+                if args.response_secret_vault:
+                    params["response_secret_vault"] = args.response_secret_vault
+                output(client.call("capability.put", params, admin_password=password_from_env()))
             elif args.capability_command == "request":
+                params = {
+                    "capability_id": args.capability_id,
+                    "method": args.method,
+                    "path": args.path,
+                    "ttl_seconds": parse_ttl(args.expiration),
+                    "max_uses": args.uses,
+                }
+                if args.host:
+                    params["host"] = args.host
+                body = args.body_file.read_text() if args.body_file else args.body
+                if body is not None:
+                    params["body"] = body
                 output(client.call(
                     "capability.request",
-                    {
-                        "capability_id": args.capability_id,
-                        "method": args.method,
-                        "path": args.path,
-                        "ttl_seconds": parse_ttl(args.expiration),
-                        "max_uses": args.uses,
-                    },
+                    params,
                     agent_token=agent_token(args),
                     reason=reason(args),
                 ))
@@ -320,7 +371,7 @@ def main(argv=None) -> int:
                 body = args.body_file.read_text() if args.body_file else args.body
                 output(client.call(
                     "capability.invoke",
-                    {"capability_id": args.capability_id, "method": args.method, "path": args.path, "body": body},
+                    {"capability_id": args.capability_id, "method": args.method, "path": args.path, "body": body, **({"host": args.host} if args.host else {})},
                     agent_token=agent_token(args),
                     reason=reason(args),
                 ))

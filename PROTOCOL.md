@@ -149,6 +149,40 @@ Human:
 {"op":"access.revoke","admin_password":"...","params":{"request":"req_..."}}
 ```
 
+## Google service-account capabilities
+
+Admin imports a service-account JSON key (validated; returns metadata only):
+
+```json
+{"op":"google_sa.import","admin_password":"...","params":{"vault":"Google","title":"credential-minter","key_json":"{...}"}}
+```
+
+Admin defines a `google_service_account` capability:
+
+```json
+{
+  "op": "capability.put",
+  "admin_password": "...",
+  "params": {
+    "id": "gcp.apikeys.create",
+    "kind": "google_service_account",
+    "backing_uri": "pass://Google/credential-minter/service_account_json",
+    "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+    "hosts": ["apikeys.googleapis.com"],
+    "methods": ["POST", "GET"],
+    "path_prefixes": ["/v2/projects/PID/locations/global/keys", "/v2/operations"],
+    "timeout_seconds": 20,
+    "response_secret_fields": ["keyString", "privateKeyData"],
+    "response_secret_reveal": false,
+    "response_secret_vault": null
+  }
+}
+```
+
+`capability.request` and `capability.invoke` accept `host` (required if the capability lists several hosts) and `body`. For this kind, the request payload, and therefore the `ad1_` authority digest, binds `host`, `url`, `body_sha256` and a human-readable `summary`. Invoke must present the same host and a byte-identical body. `access.pending` returns `summary`, `url`, `body_preview` and `body_sha256`.
+
+Invoke result: `{status, headers, body, custody_refs?, body_withheld?}`. String values under `response_secret_fields` anywhere in a JSON response are stored as new items, and in the body they are replaced with `passd-redacted:pass://VAULT/ITEM_ID/FIELD`. The access token never appears in results, errors or audit records.
+
 ## Legacy exact-secret RPCs
 
 The following v0.2 RPCs remain available for migration/backward compatibility:
