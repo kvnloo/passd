@@ -227,6 +227,31 @@ passd capability invoke openrouter.infer \
 
 `passd` injects the credential on the custody side and returns the provider response. The secret is never returned as a separate field, redirects are disabled, and exact secret echoes are redacted.
 
+## Google service-account capabilities (`google_service_account`)
+
+For Google Cloud admin APIs passd holds a service-account JSON key and mints OAuth access tokens inside custody. Agents never see the private key or the access token, and every call needs a human-approved lease, like a `sudo` prompt.
+
+```bash
+passd item import-google-sa --vault Google --title credential-minter --key-file minter.json
+passd capability put-google-sa gcp.apikeys.create \
+  --backing-uri 'pass://Google/credential-minter/service_account_json' \
+  --scope https://www.googleapis.com/auth/cloud-platform \
+  --host apikeys.googleapis.com \
+  --method POST --method GET \
+  --path-prefix /v2/projects/PID/locations/global/keys --path-prefix /v2/operations \
+  --response-secret-field keyString
+```
+
+At invoke time passd signs an RS256 JWT (`iss`/`sub` = `client_email`, `aud` = `token_uri`, `exp - iat <= 3600`) with the SA key, exchanges it at `https://oauth2.googleapis.com/token`, which is the only token endpoint it accepts, and injects `Authorization: Bearer …` into the approved request. The token is cached in memory per lease only.
+
+Differences from `http_secret`:
+
+- **Body-bound leases.** The request stores the SHA-256 of the exact body. `access pending` shows a readable `summary` (e.g. `create API key 'yt' restricted to youtube.googleapis.com in project PID`), the full `url`, a `body_preview`, and `body_sha256`.
+- **Several hosts and path prefixes** per capability. Hosts must be `*.googleapis.com`. Pass `--host` on request/invoke when there is more than one.
+- **Response hygiene.** Fields named in `response_secret_fields` (default `keyString`, `privateKeyData`) are moved into custody as new items. In the agent response they become `passd-redacted:pass://VAULT/itm_…/FIELD`, and the references are listed in `custody_refs` and in the audit log. If the provider returns a non-JSON body, passd withholds it. `--reveal-response-secrets` returns the values as well; the default is redact + store.
+
+The full GCP role list, the three recommended capabilities and the approval walkthrough are in [examples/google-minter.md](examples/google-minter.md).
+
 ## Legacy compatibility
 
 v0.2 exact-selector APIs remain available for migration/tests:

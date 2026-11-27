@@ -19,6 +19,7 @@ from .config import Config
 from .crypto import open_json, open_sealed, random_key, seal, seal_json
 from .db import connect
 from .errors import AuthError, Conflict, NotFound, PermissionDenied, ValidationError
+from . import google_sa
 from .refs import parse_pass_ref
 
 MAX_REASON_LENGTH = 300
@@ -26,6 +27,9 @@ MAX_ACCESS_TTL = 24 * 3600
 MAX_ACCESS_USES = 100
 MAX_PENDING_PER_AGENT = 32
 DEFAULT_ACCESS_TTL = 5 * 60
+CAPABILITY_KINDS = {"http_secret", "google_service_account"}
+GOOGLE_SA_FIELD = "service_account_json"
+MAX_CAPABILITY_BODY = 256 * 1024
 
 
 def now() -> int:
@@ -67,6 +71,9 @@ class PassdService:
         # Reuse one transport. Building urllib opener/handlers per invocation
         # dominated local policy latency by orders of magnitude.
         self._http_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+        # Google OAuth access tokens: memory only, keyed by lease, never persisted.
+        self._google_tokens = google_sa.TokenCache()
+        self._google_lock = threading.Lock()
 
     def close(self):
         self.db.close()
@@ -318,8 +325,8 @@ class PassdService:
         if not CAPABILITY_ID_RE.fullmatch(capability_id):
             raise ValidationError("capability id must match [a-z0-9][a-z0-9._-]{0,127}")
         kind = str(raw.get("kind") or "http_secret").strip()
-        if kind != "http_secret":
-            raise ValidationError("v0.3 supports only kind=http_secret")
+        if kind not in CAPABILITY_KINDS:
+            raise ValidationError(f"capability kind must be one of {sorted(CAPABILITY_KINDS)}")
         description = str(raw.get("description") or "").strip()
         if len(description) > 300:
             raise ValidationError("capability description must be <= 300 characters")
@@ -328,6 +335,8 @@ class PassdService:
         _, _, field = parse_pass_ref(backing_uri)
         if not field:
             raise ValidationError("capability backing_uri must name one exact field")
+        if kind == "google_service_account":
+            return self._normalize_google_definition(raw, capability_id, description, backing_uri)
 
         scheme = str(raw.get("scheme") or "https").strip().lower()
         if scheme not in {"http", "https"}:
@@ -345,14 +354,7 @@ class PassdService:
         if not methods or not set(methods) <= allowed_methods:
             raise ValidationError(f"capability methods must be drawn from {sorted(allowed_methods)}")
 
-        path_prefix = str(raw.get("path_prefix") or "/").strip()
-        if not path_prefix.startswith("/") or path_prefix.startswith("//") or any(c in path_prefix for c in "\r\n?#"):
-            raise ValidationError("capability path_prefix must be an absolute path without query/fragment")
-        decoded_prefix = urllib.parse.unquote(path_prefix)
-        if any(part == ".." for part in decoded_prefix.split("/")):
-            raise ValidationError("capability path_prefix must not contain parent traversal")
-        if len(path_prefix) > 2048:
-            raise ValidationError("capability path_prefix is too long")
+        path_prefix = self._normalize_path_prefix(raw.get("path_prefix") or "/")
 
         inject_header = self._validate_header_name(str(raw.get("inject_header") or "Authorization"))
         inject_prefix = self._validate_header_value(str(raw.get("inject_prefix") or ""))
@@ -387,8 +389,89 @@ class PassdService:
             "timeout_seconds": timeout_seconds,
         }
 
+    @staticmethod
+    def _normalize_path_prefix(value) -> str:
+        path_prefix = str(value or "").strip()
+        if not path_prefix.startswith("/") or path_prefix.startswith("//") or any(c in path_prefix for c in "\r\n?#"):
+            raise ValidationError("capability path_prefix must be an absolute path without query/fragment")
+        decoded_prefix = urllib.parse.unquote(path_prefix)
+        if any(part == ".." for part in decoded_prefix.split("/")):
+            raise ValidationError("capability path_prefix must not contain parent traversal")
+        if len(path_prefix) > 2048:
+            raise ValidationError("capability path_prefix is too long")
+        return path_prefix
+
+    def _normalize_google_definition(self, raw: dict, capability_id: str, description: str, backing_uri: str) -> dict:
+        hosts = raw.get("hosts")
+        if hosts is None and raw.get("host"):
+            hosts = [raw["host"]]
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        hosts = sorted({google_sa.normalize_google_host(h) for h in (hosts or [])})
+        if not hosts:
+            raise ValidationError("google_service_account capabilities require at least one host")
+        methods = sorted({str(m).strip().upper() for m in (raw.get("methods") or [])})
+        allowed_methods = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+        if not methods or not set(methods) <= allowed_methods:
+            raise ValidationError(f"capability methods must be drawn from {sorted(allowed_methods)}")
+        prefixes = raw.get("path_prefixes")
+        if prefixes is None and raw.get("path_prefix"):
+            prefixes = [raw["path_prefix"]]
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        prefixes = sorted({self._normalize_path_prefix(p) for p in (prefixes or [])})
+        if not prefixes:
+            raise ValidationError("google_service_account capabilities require at least one path prefix")
+        if "/" in prefixes:
+            raise ValidationError("google_service_account path prefixes must be narrower than /")
+        scopes = google_sa.normalize_scopes(raw.get("scopes"))
+        timeout_seconds = float(raw.get("timeout_seconds", 20.0))
+        if timeout_seconds <= 0 or timeout_seconds > 60:
+            raise ValidationError("capability timeout_seconds must be >0 and <=60")
+        fields = google_sa.normalize_response_secret_fields(raw.get("response_secret_fields"))
+        reveal = raw.get("response_secret_reveal", False)
+        if not isinstance(reveal, bool):
+            raise ValidationError("response_secret_reveal must be a boolean")
+        secret_vault = raw.get("response_secret_vault")
+        secret_vault = str(secret_vault).strip() if secret_vault else None
+        # Fail closed at definition time: the backing must already be a valid
+        # service-account key, and a configured custody vault must exist.
+        item_row, field = self.resolve_item_ref(backing_uri)
+        google_sa.parse_service_account_key(self._extract_field(self._item_payload(item_row), field))
+        if secret_vault:
+            self.find_vault(secret_vault)
+        return {
+            "id": capability_id,
+            "description": description,
+            "kind": "google_service_account",
+            "backing_uri": backing_uri,
+            "scheme": "https",
+            "hosts": hosts,
+            "methods": methods,
+            "path_prefixes": prefixes,
+            "scopes": scopes,
+            "timeout_seconds": timeout_seconds,
+            "response_secret_fields": fields,
+            "response_secret_reveal": reveal,
+            "response_secret_vault": secret_vault,
+        }
+
     def _public_capability(self, row) -> dict:
         definition = self._capability_payload(row)
+        if definition["kind"] == "google_service_account":
+            return {
+                "id": row["id"],
+                "version": row["version"],
+                "kind": definition["kind"],
+                "description": definition.get("description", ""),
+                "target_hosts": list(definition["hosts"]),
+                "methods": list(definition["methods"]),
+                "path_prefixes": list(definition["path_prefixes"]),
+                "scopes": list(definition["scopes"]),
+                "response_secret_fields": list(definition["response_secret_fields"]),
+                "response_secret_reveal": bool(definition["response_secret_reveal"]),
+                "binds_body": True,
+            }
         return {
             "id": row["id"],
             "version": row["version"],
@@ -457,10 +540,25 @@ class PassdService:
         decoded = urllib.parse.unquote(parsed.path)
         if any(part == ".." for part in decoded.split("/")):
             raise ValidationError("capability path must not contain parent traversal")
-        decoded_prefix = urllib.parse.unquote(definition["path_prefix"])
-        if not self._path_in_capability(decoded, decoded_prefix):
+        prefixes = definition.get("path_prefixes") or [definition["path_prefix"]]
+        if not any(self._path_in_capability(decoded, urllib.parse.unquote(p)) for p in prefixes):
             raise PermissionDenied("requested path exceeds capability contract")
         return method, parsed.path
+
+    def _capability_host(self, definition: dict, host: str | None) -> str:
+        if definition["kind"] == "google_service_account":
+            hosts = list(definition["hosts"])
+            if not host:
+                if len(hosts) != 1:
+                    raise ValidationError("this capability spans several hosts; name the exact host")
+                return hosts[0]
+            h = self._normalize_host(host)
+            if h not in hosts:
+                raise PermissionDenied("requested host exceeds capability contract")
+            return h
+        if host and self._normalize_host(host) != definition["host"]:
+            raise PermissionDenied("requested host exceeds capability contract")
+        return definition["host"]
 
     # ---------- machine accounts / API keys ----------
     def create_agent(
@@ -644,6 +742,8 @@ class PassdService:
         reason: str | None,
         ttl_seconds: int,
         max_uses: int,
+        host: str | None = None,
+        body: str | None = None,
     ) -> dict:
         self._require_agent_scope(agent, "capability.request")
         self._require_agent_scope(agent, "capability.invoke")
@@ -661,8 +761,9 @@ class PassdService:
         cap_row = self.get_capability_row(capability_id)
         definition = self._capability_payload(cap_row)
         method, path = self._validate_capability_invocation(definition, method, path)
+        target_host = self._capability_host(definition, host)
         ceiling = json.loads(agent["allowed_hosts_json"])
-        if ceiling and not self._host_allowed(definition["host"], ceiling):
+        if ceiling and not self._host_allowed(target_host, ceiling):
             raise PermissionDenied("capability target exceeds this agent API key's host ceiling")
 
         base_payload = {
@@ -675,6 +776,20 @@ class PassdService:
             "requested_ttl": ttl_seconds,
             "requested_uses": max_uses,
         }
+        if definition["kind"] == "google_service_account":
+            # Google admin calls are body-bound: the human approves this exact
+            # request body (by hash) and sees a sudo-style summary of it.
+            if body is not None and not isinstance(body, str):
+                raise ValidationError("capability body must be a string")
+            if body is not None and len(body.encode("utf-8")) > MAX_CAPABILITY_BODY:
+                raise ValidationError("capability body is too large")
+            base_payload.update({
+                "host": target_host,
+                "url": f"https://{target_host}{path}",
+                "body_sha256": google_sa.body_sha256(body),
+                "body_preview": google_sa.body_preview(body),
+                "summary": google_sa.summarize_request(target_host, method, path, body),
+            })
         ts = now()
         with self._db_lock:
             pending = list(
@@ -710,7 +825,7 @@ class PassdService:
                     request_id,
                     agent["id"],
                     "capability.invoke",
-                    definition["host"],
+                    target_host,
                     self._seal_access_payload(request_id, payload),
                     ts,
                 ),
@@ -721,7 +836,7 @@ class PassdService:
             agent["id"],
             "capability.request",
             None,
-            definition["host"],
+            target_host,
             reason,
             True,
             {"request_id": request_id, "capability_id": cap_row["id"], "authority_digest": payload["authority_digest"]},
@@ -764,7 +879,11 @@ class PassdService:
                 "method": payload.get("method"),
                 "path": payload.get("path"),
                 "authority_digest": payload.get("authority_digest"),
+                "summary": payload.get("summary") or f"{payload.get('method')} {row['target_host']}{payload.get('path')}",
             })
+            for key in ("url", "body_sha256", "body_preview"):
+                if key in payload:
+                    out[key] = payload[key]
         elif include_selector:
             v, i, f = payload.get("selector", ["", "", ""])
             out["uri"] = f"pass://{urllib.parse.quote(v, safe='')}/{urllib.parse.quote(i, safe='')}/{urllib.parse.quote(f, safe='')}"
@@ -838,7 +957,9 @@ class PassdService:
                 definition = self._capability_payload(cap_row)
                 self._validate_capability_invocation(definition, payload["method"], payload["path"])
                 item_row, field = self.resolve_item_ref(definition["backing_uri"])
-                self._extract_field(self._item_payload(item_row), field)
+                backing_value = self._extract_field(self._item_payload(item_row), field)
+                if definition["kind"] == "google_service_account":
+                    google_sa.parse_service_account_key(backing_value)
                 payload["approved_credential_version"] = self._credential_version(item_row, field)
                 payload["approved_capability_version"] = cap_row["version"]
                 audit_detail = {
@@ -926,6 +1047,7 @@ class PassdService:
                 raise Conflict("access lease was already changed")
             self.db.commit()
             item_row = self.db.execute("SELECT * FROM items WHERE id=?", (row["item_id"],)).fetchone() if row["item_id"] else None
+            self._google_tokens.drop_lease(request_id)
             self.audit(row["agent_id"], "access.revoke", item_row, row["target_host"], None, False, {"request_id": request_id})
             return self._access_public(self.get_access_request(request_id))
 
@@ -989,6 +1111,7 @@ class PassdService:
                         (ts, row["id"]),
                     )
                     self.db.commit()
+                    self._google_tokens.drop_lease(row["id"])
                     continue
                 # Atomic budget claim. The short lock only covers SQLite and
                 # crypto bookkeeping, never the outbound network request.
@@ -1004,7 +1127,7 @@ class PassdService:
         self.audit(agent["id"], capability, None, target_host, reason, False, {"why": "no_active_hitl_grant"})
         raise PermissionDenied("no active HITL grant for this exact credential scope")
 
-    def _consume_capability_grant(self, agent, capability_id: str, method: str, path: str, reason: str | None):
+    def _consume_capability_grant(self, agent, capability_id: str, method: str, path: str, reason: str | None, host: str | None = None, body: str | None = None):
         if not reason or not reason.strip():
             self.audit(agent["id"], "capability.invoke", None, None, reason, False, {"why": "missing_reason"})
             raise PermissionDenied("capability invocation requires a non-empty reason")
@@ -1015,9 +1138,12 @@ class PassdService:
             raise PermissionDenied("no active HITL lease for this exact capability request") from None
         definition = self._capability_payload(cap_row)
         method, path = self._validate_capability_invocation(definition, method, path)
+        target_host = self._capability_host(definition, host)
         ceiling = json.loads(agent["allowed_hosts_json"])
-        if ceiling and not self._host_allowed(definition["host"], ceiling):
+        if ceiling and not self._host_allowed(target_host, ceiling):
             raise PermissionDenied("capability target exceeds this agent API key's host ceiling")
+        body_bound = definition["kind"] == "google_service_account"
+        body_hash = google_sa.body_sha256(body) if body_bound else None
 
         ts = now()
         with self._db_lock:
@@ -1033,12 +1159,15 @@ class PassdService:
                     continue
                 if payload.get("capability_id") != cap_row["id"] or payload.get("method") != method or payload.get("path") != path:
                     continue
+                if body_bound and (payload.get("host") != target_host or payload.get("body_sha256") != body_hash):
+                    continue
                 if not hmac.compare_digest(str(payload.get("capability_version") or ""), str(cap_row["version"])):
                     self.db.execute(
                         "UPDATE access_requests SET status='stale',reviewed_at=? WHERE id=? AND status='approved'",
                         (ts, row["id"]),
                     )
                     self.db.commit()
+                    self._google_tokens.drop_lease(row["id"])
                     continue
                 item_row = self.db.execute("SELECT * FROM items WHERE id=?", (row["item_id"],)).fetchone() if row["item_id"] else None
                 field = parse_pass_ref(definition["backing_uri"])[2]
@@ -1055,6 +1184,7 @@ class PassdService:
                         (ts, row["id"]),
                     )
                     self.db.commit()
+                    self._google_tokens.drop_lease(row["id"])
                     continue
                 cur = self.db.execute(
                     "UPDATE access_requests SET uses=uses+1 WHERE id=? AND status='approved' AND expires_at>? AND uses<max_uses",
@@ -1065,7 +1195,7 @@ class PassdService:
                     continue
                 return row, cap_row, definition, item_row, field, item_payload
 
-        self.audit(agent["id"], "capability.invoke", None, definition["host"], reason, False, {"capability_id": cap_row["id"], "why": "no_active_hitl_lease"})
+        self.audit(agent["id"], "capability.invoke", None, target_host, reason, False, {"capability_id": cap_row["id"], "why": "no_active_hitl_lease"})
         raise PermissionDenied("no active HITL lease for this exact capability request")
 
     def list_authorized_vaults(self, agent) -> list[dict]:
@@ -1232,11 +1362,14 @@ class PassdService:
         body: str | None,
         agent_token: str | None,
         reason: str | None,
+        host: str | None = None,
     ) -> dict:
         agent = self.authenticate_agent(agent_token)
         grant, cap_row, definition, item_row, field, item_payload = self._consume_capability_grant(
-            agent, capability_id, method, path, reason
+            agent, capability_id, method, path, reason, host=host, body=body
         )
+        if definition["kind"] == "google_service_account":
+            return self._invoke_google(agent, grant, cap_row, definition, item_row, field, item_payload, method, path, body, reason)
         secret_value = self._extract_field(item_payload, field)
         if not isinstance(secret_value, (str, int, float)):
             raise ValidationError("capability secret field must be a scalar value")
@@ -1272,6 +1405,154 @@ class PassdService:
                 "method": method,
                 "path": path,
                 "status": result["status"],
+            },
+        )
+        return result
+
+    # ---------- Google service-account custody ----------
+    def import_google_service_account(self, vault_ref: str, title: str, key_json, *, note: str = "") -> dict:
+        """Validate and store a service-account JSON key. Returns metadata only."""
+        data = google_sa.parse_service_account_key(key_json)
+        text = key_json if isinstance(key_json, str) else json_dumps(data)
+        with self._db_lock:
+            vrow = self.find_vault(vault_ref)
+            source = {"kind": "google_service_account", "id": f"{vrow['id']}/{title.strip()}"}
+            # Stable source id: re-importing the same vault/title rotates the
+            # key in place (staling leases) instead of creating a duplicate.
+            for other in self.db.execute("SELECT * FROM items WHERE vault_id=?", (vrow["id"],)):
+                if other["source_id"] != source["id"] and self._item_payload(other).get("title") == title.strip():
+                    raise Conflict(f"an unrelated item titled {title!r} already exists in this vault")
+            item = self.put_item(
+                vrow["id"],
+                title,
+                {GOOGLE_SA_FIELD: text, "client_email": data["client_email"]},
+                item_type="google_service_account",
+                note=note,
+                source=source,
+            )
+        vault_name = self._vault_payload(vrow).get("name") or vrow["id"]
+        return {
+            "id": item["id"],
+            "vault_id": item["vault_id"],
+            "title": item["title"],
+            "backing_uri": self._pass_uri(vault_name, title, GOOGLE_SA_FIELD),
+            **google_sa.public_key_summary(data),
+        }
+
+    @staticmethod
+    def _pass_uri(vault: str, item: str, field: str) -> str:
+        q = lambda v: urllib.parse.quote(v, safe="")  # noqa: E731
+        return f"pass://{q(vault)}/{q(item)}/{q(field)}"
+
+    def _google_fetch_token(self, key_data: dict, scopes: list[str], timeout: float) -> tuple[str, int]:
+        token_uri = key_data["token_uri"]
+        if token_uri != google_sa.GOOGLE_TOKEN_URI:
+            raise PermissionDenied("service-account token_uri is not the Google OAuth endpoint")
+        self._validate_target(token_uri, agent=None)
+        assertion = google_sa.build_assertion(key_data, scopes)
+        req = urllib.request.Request(
+            token_uri,
+            data=google_sa.token_request_body(assertion),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._http_opener.open(req, timeout=timeout) as resp:
+                return google_sa.parse_token_response(resp.status, resp.read(google_sa.MAX_TOKEN_RESPONSE + 1))
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return google_sa.parse_token_response(exc.code, b"")
+        except urllib.error.URLError:
+            raise PermissionDenied("Google token exchange failed: network error") from None
+
+    def _google_access_token(self, grant, definition: dict, key_data: dict, credential_ver: str) -> str:
+        cache_key = (grant["id"], definition["id"], credential_ver, tuple(definition["scopes"]))
+        with self._google_lock:
+            token = self._google_tokens.get(cache_key)
+            if token:
+                return token
+            token, expires_in = self._google_fetch_token(key_data, list(definition["scopes"]), float(definition.get("timeout_seconds", 20.0)))
+            # Cache only for the lifetime of both the token and the lease.
+            lease_left = int(grant["expires_at"] or 0) - now()
+            self._google_tokens.put(cache_key, token, min(expires_in, lease_left))
+            return token
+
+    def _store_minted_secret(self, definition: dict, grant, backing_vault_id: str, field: str, value: str, ctx: dict) -> str:
+        vault_ref = definition.get("response_secret_vault") or backing_vault_id
+        title = f"{definition['id']} {field} {grant['id']} {secrets.token_hex(4)}"
+        note = json_dumps({
+            "minted_by": "passd google_service_account capability",
+            "capability_id": definition["id"],
+            "lease": grant["id"],
+            "field": field,
+            "context": ctx,
+            "minted_at": now(),
+        })
+        with self._db_lock:
+            item = self.put_item(vault_ref, title, {field: value}, item_type="google_minted_secret", note=note)
+            vrow = self.find_vault(item["vault_id"])
+        vault_name = self._vault_payload(vrow).get("name") or vrow["id"]
+        return self._pass_uri(vault_name, item["id"], field)
+
+    def _invoke_google(self, agent, grant, cap_row, definition, item_row, field, item_payload, method, path, body, reason) -> dict:
+        key_data = google_sa.parse_service_account_key(self._extract_field(item_payload, field))
+        method, path = self._validate_capability_invocation(definition, method, path)
+        payload = self._access_payload(grant)
+        host = payload["host"]
+        url = f"https://{host}{path}"
+        self._validate_target(url, agent=agent)
+        token = self._google_access_token(grant, definition, key_data, payload.get("approved_credential_version") or "")
+        headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        result = self._execute_http(
+            url,
+            method=method,
+            headers=headers,
+            body=body,
+            secret_text=token,
+            timeout=float(definition.get("timeout_seconds", 20.0)),
+        )
+        # Lease exhausted by this call: forget its token immediately.
+        if int(grant["uses"]) + 1 >= int(grant["max_uses"]):
+            with self._google_lock:
+                self._google_tokens.drop_lease(grant["id"])
+
+        minted: list[str] = []
+        fields = set(definition.get("response_secret_fields") or [])
+        if fields:
+            try:
+                decoded = json.loads(result["body"]) if result["body"].strip() else None
+            except json.JSONDecodeError:
+                decoded = None
+                result["body"] = "<non-JSON response withheld by passd: capability declares response secret fields>"
+                result["body_withheld"] = True
+            if decoded is not None:
+                def store(f, v, ctx):
+                    ref = self._store_minted_secret(definition, grant, item_row["vault_id"], f, v, ctx)
+                    minted.append(ref)
+                    return ref
+                rewritten = google_sa.extract_response_secrets(decoded, fields, store, reveal=bool(definition.get("response_secret_reveal")))
+                result["body"] = json_dumps(rewritten)
+                result["headers"].pop("Content-Length", None)
+                result["headers"].pop("content-length", None)
+        if minted:
+            result["custody_refs"] = minted
+        self.audit(
+            agent["id"],
+            "capability.invoke",
+            item_row,
+            host,
+            reason,
+            True,
+            {
+                "request_id": grant["id"],
+                "capability_id": cap_row["id"],
+                "capability_version": cap_row["version"],
+                "method": method,
+                "path": path,
+                "status": result["status"],
+                "minted_refs": minted,
             },
         )
         return result
@@ -1384,6 +1665,8 @@ class PassdService:
                 reason=reason,
                 ttl_seconds=int(p.get("ttl_seconds", DEFAULT_ACCESS_TTL)),
                 max_uses=int(p.get("max_uses", 1)),
+                host=p.get("host"),
+                body=p.get("body"),
             )
         if op == "capability.invoke":
             return self.invoke_capability(
@@ -1393,7 +1676,11 @@ class PassdService:
                 body=p.get("body"),
                 agent_token=token,
                 reason=reason,
+                host=p.get("host"),
             )
+        if op == "google_sa.import":
+            self.verify_admin_password(admin)
+            return self.import_google_service_account(p["vault"], p["title"], p["key_json"], note=p.get("note", ""))
 
         if op == "agent.create":
             self.verify_admin_password(admin)

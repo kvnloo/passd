@@ -63,6 +63,10 @@ Additional v0.3.1 vulnerability regressions prove:
 
 The typed contract verifies that the adapter never receives the private Proton backing selector.
 
+## google_service_account capability (2026-11-26)
+
+`tests/test_google_service_account.py`: 28 tests, all passing on Python 3.13 with no network. The OAuth/Google endpoints are an in-process fake opener and DNS is patched. Covered: the RS256 JWT verifies against the throwaway public key (claims, `kid`, `exp - iat <= 3600`, tamper rejection); invalid key JSON is rejected without echoing key material; host/scope/prefix validation; the sudo-style `summary` in `access.pending`; body/host/method/path binding; agent host ceiling; use budget and expiry; per-lease in-memory token cache, dropped on revoke, exhaustion and stale; the access token and PEM are absent from responses, audit, logging and on-disk files; `keyString`/`privateKeyData` (including nested operation responses) are redacted and stored, and readable by admin only; the reveal option; non-JSON bodies are withheld; token-exchange failure does not echo the body; re-importing the key rotates it in place and stales the lease; the RPC socket flow and CLI parser.
+
 ## Performance receipt
 
 `benchmarks/baseline-20260918.json` was generated with 1,000 local iterations and 100 full loopback invocations. `benchmarks/compare.py` passes when comparing the baseline to itself, proving the regression-gate format is consumable.
